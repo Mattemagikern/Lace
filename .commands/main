@@ -1,0 +1,4 @@
+#!/bin/bash -e
+
+#go run main.go tests/src tests/dest --dryrun
+go run main.go tests/src m@localhost:9090:~/workspace/dest #--dryrun

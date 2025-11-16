@@ -1,0 +1,14 @@
+# Command manifest
+#<name>:
+#  path: <path to script>
+#  help: "A short description"
+#  args: <argument string>
+#  dependencies:
+#      - <A dependency>
+#      - <Another dependency>
+#
+install:
+  path: .commands/install
+
+main:
+  path: .commands/main

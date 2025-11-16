@@ -1,0 +1,33 @@
+# north.yml template
+# A north manifest may contain the following fields: Projects, Command-Manifest, and Self.
+
+# The Projects tag contains a list of projects which the native commands use to navigate or
+# structure your project.
+# Each project contains needs to define 3 things: a path, remote(s) and a revision.
+# A remote is specified by two fields: its name and where it is located.
+
+# The Command-Manifest is a path to a command manifest where a list of custom commands can be specified.
+# The commands specified in the command-manifest is appended to the default
+# commands (help, init, sync, lock, list, and status).
+
+# The Self tag specifies the project which the north.yml tag is version controlled in.
+# This is highly recommended to use since when performing a sync it is of utmost
+# importance that the manifest is updated first otherwise your dependencies may
+# not be in the correct version.
+
+# Below you'll find a north manifest template. Far from everything is required.
+
+#Projects: <optional>
+#    - path: <path where to place the cloned repository>
+#      revision: <branch, sha-1 etc. <semi-optional>> <<origin/master>>
+#      remotes: <which remote to use>
+#           <name>: <URL>
+#
+Command-Manifest: .commands/manifest.yml
+#
+#Self: <semi-optional, highly recommended>
+#    path: . #self.path is always set to "."
+#    revision: origin/master
+#    remotes:
+#        origin: git@github.com:someuser/north.git
+#        upstream: git@github.com:Mattemagikern/north.git
