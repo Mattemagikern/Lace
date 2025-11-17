@@ -6,12 +6,12 @@ import (
 )
 
 type MetaData struct {
-	Path string
-	Size int64
-	Mode os.FileMode
+	Path  string
+	Size  int64
+	Mode  os.FileMode
 	IsDir bool
-	Time int64
-	Link string
+	Time  int64
+	Link  string
 }
 
 type FileIndex map[string]MetaData
@@ -26,16 +26,16 @@ func MakeIndex(root string) (FileIndex, error) {
 
 		rellative, _ := filepath.Rel(root, path)
 		link := ""
-		if info.Mode() & os.ModeSymlink != 0 {
+		if info.Mode()&os.ModeSymlink != 0 {
 			link, _ = os.Readlink(path)
 		}
 		files[rellative] = MetaData{
-			Path: rellative,
-			Size: info.Size(),
-			Mode: info.Mode(),
+			Path:  rellative,
+			Size:  info.Size(),
+			Mode:  info.Mode(),
 			IsDir: info.IsDir(),
-			Time: info.ModTime().Unix(),
-			Link: link,
+			Time:  info.ModTime().Unix(),
+			Link:  link,
 		}
 		return nil
 	})
@@ -50,7 +50,7 @@ func PushFilterFiles(my, remote FileIndex) (changed, deleted FileIndex) {
 		if remoteInfo, exists := remote[path]; !exists {
 			// Exists locally but not remotely -> new file
 			changed[path] = myInfo
-		} else if myInfo.Mode &  os.ModeSymlink != 0 && myInfo.Link == remoteInfo.Link {
+		} else if myInfo.Mode&os.ModeSymlink != 0 && myInfo.Link == remoteInfo.Link {
 			// Don't change symlink if same
 			continue
 		} else if !myInfo.IsDir && (myInfo.Size != remoteInfo.Size || myInfo.Time != remoteInfo.Time) {
@@ -61,12 +61,12 @@ func PushFilterFiles(my, remote FileIndex) (changed, deleted FileIndex) {
 	// Remove directories from changed list
 	traversed := make(map[string]bool)
 	for path := range changed {
-	    dir := filepath.Dir(path)
-	    for !traversed[dir] && dir != "." {
-		traversed[dir] = true
+		dir := filepath.Dir(path)
 		delete(changed, dir)
-		dir = filepath.Dir(dir)
-	    }
+		for !traversed[dir] && dir != "." {
+			traversed[dir] = true
+			dir = filepath.Dir(dir)
+		}
 	}
 	// Files that exist remotely but not locally -> deleted
 	for path, remoteInfo := range remote {
@@ -86,7 +86,7 @@ func PullFilterFiles(my, remote FileIndex) (changed, deleted FileIndex) {
 		if myInfo, exists := my[path]; !exists {
 			// Exists remotely but not locally -> new file
 			changed[path] = remoteInfo
-		} else if myInfo.Mode &  os.ModeSymlink != 0 && myInfo.Link == remoteInfo.Link {
+		} else if myInfo.Mode&os.ModeSymlink != 0 && myInfo.Link == remoteInfo.Link {
 			// Don't change symlink if same
 			continue
 		} else if !myInfo.IsDir && (myInfo.Size != remoteInfo.Size || myInfo.Time != remoteInfo.Time) {
@@ -98,12 +98,12 @@ func PullFilterFiles(my, remote FileIndex) (changed, deleted FileIndex) {
 	// Remove directories from changed list
 	traversed := make(map[string]bool)
 	for path := range changed {
-	    dir := filepath.Dir(path)
-	    for !traversed[dir] && dir != "." {
-		traversed[dir] = true
-		delete(changed, dir)
-		dir = filepath.Dir(dir)
-	    }
+		dir := filepath.Dir(path)
+		for !traversed[dir] && dir != "." {
+			traversed[dir] = true
+			delete(changed, dir)
+			dir = filepath.Dir(dir)
+		}
 	}
 
 	// Files that exist locally but not remotely -> deleted

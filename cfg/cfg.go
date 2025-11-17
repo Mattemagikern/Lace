@@ -1,31 +1,36 @@
 package cfg
 
 import (
-	"os"
 	"fmt"
+	"os"
 	"strings"
+	"runtime"
 
 	"github.com/Mattemagikern/flags"
 )
+
 var (
-	TIME		string = ""
-	VERSION 	string = ""
-	Version 	= false
-	Verbose 	= false
-	Server 		= false
-	Install 	= false
-	Help   		= false
-	Dryrun 		= false
-	f 		= flags.NewFlagSet()
+	TIME    string = ""
+	VERSION string = ""
+	Version        = false
+	Verbose        = false
+	Server         = false
+	Install        = false
+	Help           = false
+	Dryrun         = false
+	Jobs 	 	= runtime.NumCPU()
+	
+	f              = flags.NewFlagSet()
 )
 
-func Make() ([]string, error){
+func Make() ([]string, error) {
 	f.SetFlag(&Version, flags.Key{"", "--version"}, "Prints version")
 	f.SetFlag(&Verbose, flags.Key{"-v", "--verbose"}, "enables verbose logging")
 	f.SetFlag(&Help, flags.Key{"-h", "--help"}, "Prints this message")
 	f.SetFlag(&Dryrun, flags.Key{"", "--dryrun"}, "performs a dry run, no changes made")
 	f.SetFlag(&Install, flags.Key{"", "--install"}, "installs this program on the remote server")
 	f.SetFlag(&Server, flags.Key{"", "--server"}, "starts server instance")
+	f.SetFlag(&Jobs, flags.Key{"-j", "--jobs"}, "number of concurrent file transfers (default numcpu)")
 
 	args, err := f.Parse(os.Args[1:])
 	if err != nil {
@@ -34,7 +39,7 @@ func Make() ([]string, error){
 	return args, nil
 }
 
-func PrintHelpAndExit(){
+func PrintHelpAndExit() {
 	fmt.Printf("Usage: %s [options] [arguments]\n", os.Args[0])
 	for _, line := range f.Help() {
 		fmt.Println("\t" + strings.Join(line[:], ", "))

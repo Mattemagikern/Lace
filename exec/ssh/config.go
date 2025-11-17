@@ -3,19 +3,18 @@ package ssh
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"fmt"
+	"golang.org/x/term"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"fmt"
-	"errors"
-	"golang.org/x/term"
 
 	"io/fs"
 
-	"golang.org/x/crypto/ssh"
-//	"golang.org/x/crypto/ssh/knownhosts"
 	"github.com/mattemagikern/lace/files"
+	"golang.org/x/crypto/ssh"
 )
 
 type SSHConfig struct {
@@ -148,10 +147,7 @@ func passwordCallbackPrompt(prompt string) ssh.AuthMethod {
 				pwErr = err
 				return
 			}
-			// copy to string (required by ssh.PasswordCallback)
 			pw = string(b)
-
-			// zero the byte slice asap
 			for i := range b {
 				b[i] = 0
 			}
@@ -205,7 +201,15 @@ func MakeSSHConfig(hostAddress string) (*ssh.ClientConfig, error) {
 		return nil, err
 	}
 	if conf, ok := configs[hostAddress]; ok {
-		sshConfig := &ssh.ClientConfig{}
+		algorithms := ssh.SupportedAlgorithms()
+		sshConfig := &ssh.ClientConfig{
+			HostKeyAlgorithms: algorithms.HostKeys,
+			Config: ssh.Config{
+				KeyExchanges: algorithms.KeyExchanges,
+				Ciphers:      algorithms.Ciphers,
+				MACs:         algorithms.MACs,
+			},
+		}
 		if conf.User != "" {
 			sshConfig.User = conf.User
 		} else {
@@ -218,20 +222,21 @@ func MakeSSHConfig(hostAddress string) (*ssh.ClientConfig, error) {
 			sshConfig.Auth = parseIdentityFiles(conf.IdentityFile)
 		}
 
-		/*
-		hostKeyCallback, err := knownhosts.New(filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"))
-		if err != nil {
-			return nil, err
-		}
-		sshConfig.HostKeyCallback = hostKeyCallback
-		*/
-
 		sshConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 		return sshConfig, nil
 	}
-	return &ssh.ClientConfig {
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		User: os.Getenv("USER"),
-		Auth: append(defaultKeys(), passwordCallbackPrompt("Password: ")),
+	algorithms := ssh.SupportedAlgorithms()
+	fastCiphers := []string{ssh.CipherAES128GCM, ssh.CipherAES256GCM, ssh.CipherChaCha20Poly1305}
+	fastMacs := []string{ssh.HMACSHA256ETM, ssh.HMACSHA256ETM}
+	return &ssh.ClientConfig{
+		HostKeyCallback:   ssh.InsecureIgnoreHostKey(),
+		User:              os.Getenv("USER"),
+		Auth:              append(defaultKeys(), passwordCallbackPrompt("Password: ")),
+		HostKeyAlgorithms: algorithms.HostKeys,
+		Config: ssh.Config{
+			KeyExchanges: algorithms.KeyExchanges,
+			Ciphers:      fastCiphers,
+			MACs:         fastMacs,
+		},
 	}, nil
 }

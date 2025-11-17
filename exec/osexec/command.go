@@ -1,17 +1,18 @@
 package osexec
 
 import (
-	"os"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
-	myexec "github.com/mattemagikern/lace/exec"
+
 	"github.com/mattemagikern/lace/cfg"
+	myexec "github.com/mattemagikern/lace/exec"
 )
 
 type LocalExec struct {
 	command string
-	cmd    *exec.Cmd
+	cmd     *exec.Cmd
 
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
@@ -41,7 +42,7 @@ func (peer *LocalExec) Open() error {
 		if err != nil {
 			return err
 		}
-		go func () {
+		go func() {
 			io.Copy(os.Stderr, stderr)
 		}()
 	}
@@ -52,8 +53,16 @@ func (peer *LocalExec) Read(p []byte) (n int, err error) {
 	return peer.stdout.Read(p)
 }
 
+func (peer *LocalExec) ReadFrom(r io.Reader) (n int64, err error) {
+	return io.Copy(peer.stdin, r)
+}
+
 func (peer *LocalExec) Write(p []byte) (n int, err error) {
 	return peer.stdin.Write(p)
+}
+
+func (peer *LocalExec) WriteTo(p io.Writer) (n int64, err error) {
+	return io.Copy(p, peer.stdout)
 }
 
 func (peer *LocalExec) Close() error {

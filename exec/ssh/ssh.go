@@ -6,20 +6,20 @@ import (
 	"os"
 	"strings"
 
-	"golang.org/x/crypto/ssh"
-	"github.com/mattemagikern/lace/exec"
 	"github.com/mattemagikern/lace/cfg"
+	"github.com/mattemagikern/lace/exec"
+	"golang.org/x/crypto/ssh"
 )
 
 type SSH struct {
-	remote string
+	remote  string
 	command string
 	ssh_cfg *ssh.ClientConfig
 
-	client *ssh.Client
+	client  *ssh.Client
 	session *ssh.Session
-	stdin  io.WriteCloser
-	stdout io.Reader
+	stdin   io.WriteCloser
+	stdout  io.Reader
 }
 
 func ParseDestination(input string) (string, string) {
@@ -64,14 +64,14 @@ func NewPipe(target string, command string) exec.Pipe {
 		}
 	}
 
-	return &SSH {
+	return &SSH{
 		ssh_cfg: cfg,
 		remote:  remote,
 		command: command,
 	}
 }
 
-func (peer *SSH)Open() error {
+func (peer *SSH) Open() error {
 	client, err := ssh.Dial("tcp", peer.remote, peer.ssh_cfg)
 	if err != nil {
 		return err
@@ -96,7 +96,6 @@ func (peer *SSH)Open() error {
 	peer.session = session
 	peer.stdin = stdin
 	peer.stdout = stdout
-
 
 	if cfg.Verbose {
 		stderr, err := session.StderrPipe()
@@ -124,4 +123,29 @@ func (peer *SSH) Read(p []byte) (n int, err error) {
 
 func (peer *SSH) Write(p []byte) (n int, err error) {
 	return peer.stdin.Write(p)
+}
+
+func (peer *SSH) ReadFrom(r io.Reader) (n int64, err error) {
+	return io.Copy(peer.stdin, r)
+}
+
+func (peer *SSH) WriteTo(w io.Writer) (n int64, err error) {
+	return io.Copy(w, peer.stdout)
+}
+
+func Upload(remote, localPath, remotePath string) error {
+	file, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	fmt.Println("Uploading", localPath, "to", remote+":"+remotePath)
+	peer := NewPipe(remote, fmt.Sprintf("cat > %s", remotePath))
+	if err := peer.Open(); err != nil {
+		return err
+	}
+	defer peer.Close()
+
+	_, err = peer.ReadFrom(file)
+	return err
 }

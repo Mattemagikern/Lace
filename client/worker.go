@@ -2,36 +2,51 @@ package client
 
 import (
 	"fmt"
-	"os"
+	"io"
 	"log/slog"
+	"os"
+	"time"
 
-	"github.com/mattemagikern/lace/protocol"
-	"github.com/mattemagikern/lace/files"
+	"github.com/schollz/progressbar/v3"
+
 	"github.com/mattemagikern/lace/exec"
+	"github.com/mattemagikern/lace/files"
+	"github.com/mattemagikern/lace/protocol"
 )
 
 type DeleteOp struct {
 	remote bool
-	path string
+	path   string
 }
 
 type Fileop struct {
-	path string
+	path        string
 	remote_path string
 }
 
+type IndexOp struct {
+	path string
+	res  chan *files.FileIndex
+}
+
 type WorkSet struct {
-	Delete	chan DeleteOp
-	Write 	chan Fileop
-	Read  	chan Fileop
-	Done 	chan bool
+	Progress *progressbar.ProgressBar
+
+	Index  chan IndexOp
+	Delete chan DeleteOp
+	Write  chan Fileop
+	Read   chan Fileop
+}
+
+func (ws *WorkSet) RequestIndex(path string, res chan *files.FileIndex) {
+	ws.Index <- IndexOp{path, res}
 }
 
 func (ws *WorkSet) WriteFile(local_path, remote_path string) {
 	ws.Write <- Fileop{local_path, remote_path}
 }
 
-func (ws *WorkSet) ReadFile(remote_path, local_path string) {
+func (ws *WorkSet) ReadFile(local_path, remote_path string) {
 	ws.Read <- Fileop{local_path, remote_path}
 }
 
@@ -43,18 +58,48 @@ func (ws *WorkSet) Close() {
 	close(ws.Delete)
 	close(ws.Write)
 	close(ws.Read)
+	close(ws.Index)
 }
-
 
 func Worker(ws *WorkSet, pipe exec.Pipe, dryrun bool) {
 	del := ws.Delete
 	read := ws.Read
 	write := ws.Write
+	index := ws.Index
 
 	c := protocol.NewConnection(pipe)
 	logger := slog.Default()
-	for del != nil || read != nil || write != nil {
+	for del != nil || read != nil || write != nil || index != nil {
 		select {
+		case idx, ok := <-index:
+			if !ok {
+				index = nil
+				continue
+			}
+			logger.Info(fmt.Sprintf("remote index start:%v\n", time.Now()))
+			err := c.SendMessage(protocol.TypeIndex,
+				&protocol.IndexPayload{
+					Root: idx.path,
+				})
+			if err != nil {
+				logger.Error(fmt.Sprintf("Failed to request index response: %v", err))
+				idx.res <- nil
+				continue
+			}
+			ty, payload, err := c.ReadMessage()
+			if err != nil {
+				logger.Error(fmt.Sprintf("remote index: Failed to read message: %v", err))
+				idx.res <- nil
+				continue
+			}
+			if ty != protocol.TypeIndex {
+				logger.Error("Out of sequence message type")
+				idx.res <- nil
+				continue
+			}
+			respkg, ok := payload.(*protocol.IndexPayload)
+			idx.res <- &respkg.Index
+			logger.Info(fmt.Sprintf("remote index end:%v\n", time.Now()))
 		case fp, ok := <-del:
 			if !ok {
 				del = nil
@@ -79,7 +124,6 @@ func Worker(ws *WorkSet, pipe exec.Pipe, dryrun bool) {
 					continue
 				}
 			}
-
 		case fp, ok := <-read:
 			if !ok {
 				read = nil
@@ -104,34 +148,45 @@ func Worker(ws *WorkSet, pipe exec.Pipe, dryrun bool) {
 
 			wp := payload.(*protocol.WritePayload)
 			path := files.ExpandPath(fp.path)
-			logger.Info("<-Write", "path", fp.path, "size", len(wp.Content), "mode", wp.MetaData.Mode)
+			logger.Info("<-Write", "path", fp.path, "size", wp.MetaData.Size, "mode", wp.MetaData.Mode)
 			if dryrun {
+				ws.Progress.Add(int(wp.MetaData.Size))
 				continue
 			}
 
-			if err := files.WriteFile(path, &wp.MetaData, wp.Content); err != nil {
+			if err := files.WriteFile(path, &wp.MetaData, io.MultiReader(c, ws.Progress)); err != nil {
 				logger.Error(fmt.Sprintf("Failed to write file:%v", err))
 			}
-		case fop, ok:= <-write:
+		case fop, ok := <-write:
 			if !ok {
 				write = nil
 				continue
 			}
+			var wp protocol.WritePayload
+			var err error
+			path := files.ExpandPath(fop.path)
 
-			metadata, content, err := files.ReadFile(fop.path)
+			wp.MetaData, err = files.MakeMetaData(path)
 			if err != nil {
-				logger.Error(fmt.Sprintf("Failed to read file:%v", err))
-				continue
+				logger.Error(fmt.Sprintf("Failed to make metadata:%v", err))
+				return
 			}
-			metadata.Path = fop.remote_path
-			logger.Info(fmt.Sprintf("Write->path %s(%s), size: %d, mode:%d", fop.path, fop.remote_path, len(content), metadata.Mode))
-			err = c.SendMessage(protocol.TypeWrite, &protocol.WritePayload{
-				MetaData: metadata,
-				Content: content,
-			})
+			wp.MetaData.Path = fop.remote_path
+
+			err = c.SendMessage(protocol.TypeWrite, &wp)
 			if err != nil {
 				logger.Error(fmt.Sprintf("write message error:%v", err))
+				return
+			}
+			logger.Info(fmt.Sprintf("<-Write: path %s, size: %d, mode:%d", fop.path, wp.MetaData.Size, wp.MetaData.Mode))
+			if (wp.MetaData.Mode&os.ModeDir) != 0 || wp.MetaData.Link != "" {
+				logger.Info("skipping data transfer for directory or symlink")
+				ws.Progress.Add(int(wp.MetaData.Size))
 				continue
+			}
+			if err := files.ReadFile(path, io.MultiWriter(c, ws.Progress)); err != nil {
+				logger.Error(fmt.Sprintf("Failed to write file:%v", err))
+				return
 			}
 		}
 	}

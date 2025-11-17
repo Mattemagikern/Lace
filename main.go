@@ -2,55 +2,57 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"log/slog"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/mattemagikern/lace/cfg"
-	"github.com/mattemagikern/lace/server"
 	"github.com/mattemagikern/lace/client"
 	"github.com/mattemagikern/lace/exec"
-	"github.com/mattemagikern/lace/exec/ssh"
 	"github.com/mattemagikern/lace/exec/osexec"
+	"github.com/mattemagikern/lace/exec/ssh"
+	"github.com/mattemagikern/lace/server"
 )
 
 var (
-	logger 		= slog.New(slog.NewTextHandler(os.Stderr,
-				&slog.HandlerOptions{
-					Level: slog.LevelError,
-				}))
-	server_command 	= "lace --server"
+	logger = slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{
+			Level: slog.LevelError,
+		}))
+	server_command = "lace --server"
 
-	numCPU = runtime.NumCPU()
+	numCPU    = runtime.NumCPU()
 	cacheSize = numCPU * 10
-	ws = client.WorkSet {
+	ws        = client.WorkSet{
 		Delete: make(chan client.DeleteOp, cacheSize),
-		Write: make(chan client.Fileop, cacheSize),
-		Read: make(chan client.Fileop, cacheSize),
-		Done: make(chan bool, numCPU),
+		Write:  make(chan client.Fileop, cacheSize),
+		Read:   make(chan client.Fileop, cacheSize),
+		Index:  make(chan client.IndexOp),
 	}
 )
 
 func spawnWorkers(n int, remote, server_command string, pipe func(string, string) exec.Pipe) *sync.WaitGroup {
-    	var wg sync.WaitGroup
-	for range(n) {
-		wg.Go(func() {
+	var wg sync.WaitGroup
+	logger.Info(fmt.Sprintf("spawning %d workers...", n))
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			p := pipe(remote, server_command)
 			if err := p.Open(); err != nil {
 				logger.Error(fmt.Sprintf("failed to open pipe: %v", err))
 				return
 			}
 			defer p.Close()
-			client.Worker(&ws, p, cfg.Dryrun);
-		})
+			client.Worker(&ws, p, cfg.Dryrun)
+		}()
 	}
 	return &wg
 }
 
 func main() {
-
 	args, err := cfg.Make()
 	if err != nil {
 		fmt.Println(err)
@@ -91,20 +93,21 @@ func main() {
 	}
 
 	if cfg.Install {
-		if (len(args) < 1) {
+		if len(args) < 1 {
 			fmt.Println("remote destination required for install")
 			return
 		}
 		remote, dest := ssh.ParseDestination(args[0])
-		if dest == "~" || dest == "" {
+		if dest == "" {
 			dest = "~/.local/bin/lace"
 		}
-		logger.Info(fmt.Sprintf("installing lace on remote: %s:%s", remote, dest))
-		wg := spawnWorkers(1, remote, server_command, ssh.NewPipe)
+
 		exePath, _ := os.Executable()
-		ws.WriteFile(exePath, dest)
-		ws.Close()
-		wg.Wait()
+		logger.Info(fmt.Sprintf("installing lace to %s:%s", remote, dest))
+		err := ssh.Upload(remote, exePath, dest)
+		if err != nil {
+			logger.Error(fmt.Sprintf("%v", err))
+		}
 		return
 	}
 
@@ -142,32 +145,22 @@ func main() {
 	}
 
 	if os.Lstat(src); err != nil {
-		fmt.Println("source path does not exist: %s", from)
+		fmt.Printf("source path does not exist: %s\n", from)
 		return
 	}
 
-	p := pipe(remote, server_command)
-	if err := p.Open(); err != nil {
-		logger.Error(fmt.Sprintf("failed to open pipe: %v", err))
-		return
-	}
-	defer p.Close()
-	c, err := client.NewClient(src, dest, p, &ws)
+	wg := spawnWorkers(cfg.Jobs, remote, server_command, pipe)
+	defer wg.Wait()
+	defer ws.Close()
+	c, err := client.NewClient(src, dest, &ws)
 	if err != nil {
-		fmt.Println("failed to create client: %v", err)
+		fmt.Printf("failed to create client: %v\n", err)
 		return
 	}
-	defer c.Close()
-	wg := spawnWorkers(numCPU, remote, server_command, pipe)
 
 	if push {
 		c.Push()
 	} else {
 		c.Pull()
 	}
-	ws.Close()
-
-	logger.Info("waiting for workers to finish...")
-	/* cleanup */
-	wg.Wait()
 }

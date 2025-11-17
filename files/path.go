@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
 )
 
 func ExpandPath(path string) string {
@@ -14,4 +13,3 @@ func ExpandPath(path string) string {
 	}
 	return os.ExpandEnv(path)
 }
-
