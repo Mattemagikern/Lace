@@ -1,0 +1,24 @@
+set -x
+sudo tc qdisc add dev lo root netem rate 100mbit
+
+# Incompressible profiles via the bench scripts
+WORKDIR=/dev/shm/lace-bench KEEP=1 ./bench/bench.sh large
+WORKDIR=/dev/shm/lace-bench ./bench/bench-rsync.sh large
+
+# Compressible test — must start from empty destinations or both tools
+# detect "nothing changed" and skip the actual transfer.
+mkdir -p /dev/shm/comp/src
+[ -s /dev/shm/comp/src/big.txt ] || \
+    yes "the quick brown fox jumps over the lazy dog 0123456789 ABCDEFGHIJ" \
+    | head -c 1073741824 > /dev/shm/comp/src/big.txt
+
+rm -rf /dev/shm/comp/dst-lace
+mkdir -p /dev/shm/comp/dst-lace
+time lace /dev/shm/comp/src "$USER@localhost:/dev/shm/comp/dst-lace"
+
+rm -rf /dev/shm/comp/dst-rsync
+mkdir -p /dev/shm/comp/dst-rsync
+time rsync -aW -e "ssh -c aes128-gcm@openssh.com" \
+    /dev/shm/comp/src/ "$USER@localhost:/dev/shm/comp/dst-rsync/"
+
+sudo tc qdisc del dev lo root
