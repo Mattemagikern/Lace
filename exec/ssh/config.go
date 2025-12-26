@@ -114,24 +114,6 @@ func readSSHConfigFile() ([]byte, error) {
 	return file, nil
 }
 
-func ParseSSHTarget(target string) (user, host, port string) {
-	port = ""
-
-	if atSplit := strings.SplitN(target, "@", 2); len(atSplit) == 2 {
-		user = atSplit[0]
-		target = atSplit[1]
-	}
-
-	if colonSplit := strings.SplitN(target, ":", 2); len(colonSplit) == 2 {
-		host = colonSplit[0]
-		port = colonSplit[1]
-	} else {
-		host = target
-	}
-
-	return user, host, port
-}
-
 func passwordCallbackPrompt(prompt string) ssh.AuthMethod {
 	var once sync.Once
 	var pw string
@@ -195,25 +177,34 @@ func expandHostAddress(hostAddress, port string) string {
 	return fmt.Sprintf("%s:%s", hostAddress, port)
 }
 
+var (
+	fastCiphers = []string{ssh.CipherAES128GCM, ssh.CipherAES256GCM, ssh.CipherChaCha20Poly1305}
+	fastMacs    = []string{ssh.HMACSHA256ETM, ssh.HMACSHA512ETM}
+)
+
 func MakeSSHConfig(hostAddress string) (*ssh.ClientConfig, error) {
 	configs, err := getConfigs()
 	if err != nil {
 		return nil, err
 	}
+	algorithms := ssh.SupportedAlgorithms()
+	hostKeyCB, err := verifyingHostKeyCallback()
+	if err != nil {
+		return nil, fmt.Errorf("host key verification setup failed: %w", err)
+	}
 	if conf, ok := configs[hostAddress]; ok {
-		algorithms := ssh.SupportedAlgorithms()
 		sshConfig := &ssh.ClientConfig{
 			HostKeyAlgorithms: algorithms.HostKeys,
 			Config: ssh.Config{
 				KeyExchanges: algorithms.KeyExchanges,
-				Ciphers:      algorithms.Ciphers,
-				MACs:         algorithms.MACs,
+				Ciphers:      fastCiphers,
+				MACs:         fastMacs,
 			},
 		}
 		if conf.User != "" {
 			sshConfig.User = conf.User
 		} else {
-			sshConfig.User = os.Getenv("USER") // fallback
+			sshConfig.User = os.Getenv("USER")
 		}
 
 		if len(conf.IdentityFile) == 0 {
@@ -222,14 +213,11 @@ func MakeSSHConfig(hostAddress string) (*ssh.ClientConfig, error) {
 			sshConfig.Auth = parseIdentityFiles(conf.IdentityFile)
 		}
 
-		sshConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
+		sshConfig.HostKeyCallback = hostKeyCB
 		return sshConfig, nil
 	}
-	algorithms := ssh.SupportedAlgorithms()
-	fastCiphers := []string{ssh.CipherAES128GCM, ssh.CipherAES256GCM, ssh.CipherChaCha20Poly1305}
-	fastMacs := []string{ssh.HMACSHA256ETM, ssh.HMACSHA256ETM}
 	return &ssh.ClientConfig{
-		HostKeyCallback:   ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback:   hostKeyCB,
 		User:              os.Getenv("USER"),
 		Auth:              append(defaultKeys(), passwordCallbackPrompt("Password: ")),
 		HostKeyAlgorithms: algorithms.HostKeys,

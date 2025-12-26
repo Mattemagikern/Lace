@@ -5,11 +5,31 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/mattemagikern/lace/cfg"
 	"github.com/mattemagikern/lace/exec"
 	"golang.org/x/crypto/ssh"
 )
+
+var (
+	clientsMu sync.Mutex
+	clients   = map[string]*ssh.Client{}
+)
+
+func sharedClient(remote string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	if c, ok := clients[remote]; ok {
+		return c, nil
+	}
+	c, err := ssh.Dial("tcp", remote, cfg)
+	if err != nil {
+		return nil, err
+	}
+	clients[remote] = c
+	return c, nil
+}
 
 type SSH struct {
 	remote  string
@@ -72,7 +92,7 @@ func NewPipe(target string, command string) exec.Pipe {
 }
 
 func (peer *SSH) Open() error {
-	client, err := ssh.Dial("tcp", peer.remote, peer.ssh_cfg)
+	client, err := sharedClient(peer.remote, peer.ssh_cfg)
 	if err != nil {
 		return err
 	}
@@ -133,19 +153,3 @@ func (peer *SSH) WriteTo(w io.Writer) (n int64, err error) {
 	return io.Copy(w, peer.stdout)
 }
 
-func Upload(remote, localPath, remotePath string) error {
-	file, err := os.Open(localPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	fmt.Println("Uploading", localPath, "to", remote+":"+remotePath)
-	peer := NewPipe(remote, fmt.Sprintf("cat > %s", remotePath))
-	if err := peer.Open(); err != nil {
-		return err
-	}
-	defer peer.Close()
-
-	_, err = peer.ReadFrom(file)
-	return err
-}
