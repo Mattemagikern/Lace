@@ -3,8 +3,10 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -13,6 +15,8 @@ import (
 	"github.com/mattemagikern/lace/exec"
 	"github.com/mattemagikern/lace/files"
 )
+
+var ErrLocalFile = errors.New("local file error")
 
 type MessageType uint16
 
@@ -24,6 +28,8 @@ const (
 	TypeSync    MessageType = 0x05
 	TypeSyncAck MessageType = 0x06
 )
+
+const maxPayloadSize = 1 << 30
 
 type WritePayload struct {
 	MetaData files.MetaData
@@ -47,20 +53,34 @@ type SyncPayload struct {
 }
 
 type Connection struct {
-	r io.Reader
-	w io.Writer
+	pipe exec.Pipe
+	enc  *zstd.Encoder
+	dec  *zstd.Decoder
+
+	sendBuf bytes.Buffer
+	readBuf []byte
 }
 
 func NewConnection(pipe exec.Pipe) *Connection {
-	return &Connection{r: pipe, w: pipe}
+	enc, _ := zstd.NewWriter(pipe,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1))
+	dec, _ := zstd.NewReader(pipe, zstd.WithDecoderConcurrency(1))
+	return &Connection{
+		pipe: pipe,
+		enc:  enc,
+		dec:  dec,
+	}
 }
 
-func (c *Connection) Write(w []byte) (int, error) { return c.w.Write(w) }
-func (c *Connection) Read(b []byte) (int, error)  { return c.r.Read(b) }
+func (c *Connection) Write(p []byte) (int, error) { return c.enc.Write(p) }
+func (c *Connection) Read(p []byte) (int, error)  { return c.dec.Read(p) }
+
+func (c *Connection) Flush() error { return c.enc.Flush() }
 
 func (c *Connection) readMessage() (MessageType, []byte, error) {
 	var header [6]byte
-	if _, err := io.ReadFull(c.r, header[:]); err != nil {
+	if _, err := io.ReadFull(c.dec, header[:]); err != nil {
 		return 0, nil, err
 	}
 	msgType := MessageType(binary.LittleEndian.Uint16(header[:2]))
@@ -69,63 +89,43 @@ func (c *Connection) readMessage() (MessageType, []byte, error) {
 	if length == 0 {
 		return msgType, nil, nil
 	}
-
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.r, payload); err != nil {
-		return 0, nil, err
+	if length > maxPayloadSize {
+		return 0, nil, fmt.Errorf("payload too large: %d", length)
 	}
 
-	return msgType, payload, nil
+	if cap(c.readBuf) < int(length) {
+		c.readBuf = make([]byte, length)
+	} else {
+		c.readBuf = c.readBuf[:length]
+	}
+	if _, err := io.ReadFull(c.dec, c.readBuf); err != nil {
+		return 0, nil, err
+	}
+	return msgType, c.readBuf, nil
+}
+
+func (c *Connection) SendMessageNoFlush(msgType MessageType, payload interface{}) error {
+	c.sendBuf.Reset()
+	var header [6]byte
+	c.sendBuf.Write(header[:])
+
+	if err := msgpack.NewEncoder(&c.sendBuf).Encode(payload); err != nil {
+		return fmt.Errorf("encode payload: %w", err)
+	}
+
+	data := c.sendBuf.Bytes()
+	binary.LittleEndian.PutUint16(data[0:2], uint16(msgType))
+	binary.LittleEndian.PutUint32(data[2:6], uint32(len(data)-6))
+
+	_, err := c.enc.Write(data)
+	return err
 }
 
 func (c *Connection) SendMessage(msgType MessageType, payload interface{}) error {
-	b := &bytes.Buffer{}
-
-	// Reserve header
-	b.Write(make([]byte, 6))
-
-	var err error
-
-	switch msgType {
-	case TypeIndex:
-		// msgpack encode first
-		var tmp bytes.Buffer
-		enc := msgpack.NewEncoder(&tmp)
-		if err := enc.Encode(payload); err != nil {
-			return fmt.Errorf("encode index payload: %w", err)
-		}
-
-		// Compress
-		zw, err := zstd.NewWriter(b, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-		if err != nil {
-			return fmt.Errorf("zstd writer: %w", err)
-		}
-
-		if _, err := io.Copy(zw, &tmp); err != nil {
-			zw.Close()
-			return fmt.Errorf("zstd compress: %w", err)
-		}
-
-		if err := zw.Close(); err != nil {
-			return fmt.Errorf("zstd close: %w", err)
-		}
-
-	default:
-		enc := msgpack.NewEncoder(b)
-		if err := enc.Encode(payload); err != nil {
-			return fmt.Errorf("encode payload: %w", err)
-		}
+	if err := c.SendMessageNoFlush(msgType, payload); err != nil {
+		return err
 	}
-
-	// Now rewrite header
-	data := b.Bytes()
-	payloadLen := uint32(len(data) - 6)
-
-	binary.LittleEndian.PutUint16(data[0:2], uint16(msgType))
-	binary.LittleEndian.PutUint32(data[2:6], payloadLen)
-
-	_, err = c.Write(data)
-	return err
+	return c.enc.Flush()
 }
 
 var payloadFactories = map[MessageType]func() any{
@@ -142,28 +142,43 @@ func (c *Connection) ReadMessage() (MessageType, interface{}, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-
-	factory := payloadFactories[msgType]
-	p := factory()
-
-	switch msgType {
-	case TypeIndex:
-		rd, err := zstd.NewReader(bytes.NewReader(raw))
-		if err != nil {
-			return 0, nil, fmt.Errorf("zstd decoder: %w", err)
-		}
-		defer rd.Close()
-
-		decoded, err := io.ReadAll(rd)
-		if err != nil {
-			return 0, nil, fmt.Errorf("zstd read: %w", err)
-		}
-
-		return msgType, p, msgpack.Unmarshal(decoded, p)
-
-	default:
-		return msgType, p, msgpack.Unmarshal(raw, p)
+	factory, ok := payloadFactories[msgType]
+	if !ok {
+		return 0, nil, fmt.Errorf("unknown message type: %d", msgType)
 	}
+	p := factory()
+	if err := msgpack.Unmarshal(raw, p); err != nil {
+		return 0, nil, err
+	}
+	return msgType, p, nil
+}
+
+func (c *Connection) SendFile(localPath string, meta files.MetaData, progress io.Writer) error {
+	if meta.IsDir || (meta.Mode&os.ModeSymlink) != 0 {
+		return c.SendMessageNoFlush(TypeWrite, &WritePayload{MetaData: meta})
+	}
+
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("%w: open %s: %w", ErrLocalFile, localPath, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: stat %s: %w", ErrLocalFile, localPath, err)
+	}
+	meta.Size = info.Size()
+
+	if err := c.SendMessageNoFlush(TypeWrite, &WritePayload{MetaData: meta}); err != nil {
+		return err
+	}
+
+	dst := io.Writer(c)
+	if progress != nil {
+		dst = io.MultiWriter(c, progress)
+	}
+	return files.StreamExact(dst, f, meta.Size)
 }
 
 func (c *Connection) Sync() error {
@@ -183,4 +198,8 @@ func (c *Connection) Sync() error {
 	return nil
 }
 
-func (c *Connection) Close() error { return nil }
+func (c *Connection) Close() error {
+	c.enc.Close()
+	c.dec.Close()
+	return nil
+}

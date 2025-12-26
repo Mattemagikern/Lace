@@ -1,8 +1,11 @@
 package files
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 )
 
 type MetaData struct {
@@ -16,102 +19,116 @@ type MetaData struct {
 
 type FileIndex map[string]MetaData
 
-func MakeIndex(root string) (FileIndex, error) {
-	files := make(FileIndex)
-	root = ExpandPath(root)
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+func walkSubtree(root, sub string, out chan<- MetaData) error {
+	return filepath.WalkDir(sub, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-
-		rellative, _ := filepath.Rel(root, path)
+		rel, _ := filepath.Rel(root, path)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
 		link := ""
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, _ = os.Readlink(path)
 		}
-		files[rellative] = MetaData{
-			Path:  rellative,
+		out <- MetaData{
+			Path:  rel,
 			Size:  info.Size(),
 			Mode:  info.Mode(),
-			IsDir: info.IsDir(),
+			IsDir: d.IsDir(),
 			Time:  info.ModTime().Unix(),
 			Link:  link,
 		}
 		return nil
 	})
-	return files, err
 }
 
-func PushFilterFiles(my, remote FileIndex) (changed, deleted FileIndex) {
-	deleted = make(FileIndex)
-	changed = make(FileIndex)
+func MakeIndex(root string) (FileIndex, error) {
+	root = ExpandPath(root)
+	idx := make(FileIndex)
 
-	for path, myInfo := range my {
-		if remoteInfo, exists := remote[path]; !exists {
-			// Exists locally but not remotely -> new file
-			changed[path] = myInfo
-		} else if myInfo.Mode&os.ModeSymlink != 0 && myInfo.Link == remoteInfo.Link {
-			// Don't change symlink if same
-			continue
-		} else if !myInfo.IsDir && (myInfo.Size != remoteInfo.Size || myInfo.Time != remoteInfo.Time) {
-			// Exists in both but differs -> changed file
-			changed[path] = myInfo
-		}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, err
 	}
-	// Remove directories from changed list
-	traversed := make(map[string]bool)
-	for path := range changed {
-		dir := filepath.Dir(path)
-		delete(changed, dir)
-		for !traversed[dir] && dir != "." {
-			traversed[dir] = true
-			dir = filepath.Dir(dir)
+	if !info.IsDir() {
+		out := make(chan MetaData, 1)
+		go func() {
+			defer close(out)
+			walkSubtree(root, root, out)
+		}()
+		for m := range out {
+			idx[m.Path] = m
 		}
-	}
-	// Files that exist remotely but not locally -> deleted
-	for path, remoteInfo := range remote {
-		if _, exists := my[path]; !exists {
-			deleted[path] = remoteInfo
-		}
+		return idx, nil
 	}
 
-	return changed, deleted
+	idx["."] = MetaData{Path: ".", IsDir: true, Mode: os.ModeDir}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return idx, err
+	}
+
+	out := make(chan MetaData, 1024)
+	sem := make(chan struct{}, runtime.NumCPU())
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+
+	for _, e := range entries {
+		sub := filepath.Join(root, e.Name())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := walkSubtree(root, sub, out); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	for m := range out {
+		idx[m.Path] = m
+	}
+
+	return idx, firstErr
 }
 
-func PullFilterFiles(my, remote FileIndex) (changed, deleted FileIndex) {
-	deleted = make(FileIndex)
+func FilterFiles(src, dst FileIndex) (changed, deleted FileIndex) {
 	changed = make(FileIndex)
+	deleted = make(FileIndex)
 
-	for path, remoteInfo := range remote {
-		if myInfo, exists := my[path]; !exists {
-			// Exists remotely but not locally -> new file
-			changed[path] = remoteInfo
-		} else if myInfo.Mode&os.ModeSymlink != 0 && myInfo.Link == remoteInfo.Link {
-			// Don't change symlink if same
-			continue
-		} else if !myInfo.IsDir && (myInfo.Size != remoteInfo.Size || myInfo.Time != remoteInfo.Time) {
-			// Exists in both but differs -> changed file
-			changed[path] = remoteInfo
+	for path, srcInfo := range src {
+		dstInfo, exists := dst[path]
+		switch {
+		case !exists:
+			changed[path] = srcInfo
+		case srcInfo.Mode&os.ModeSymlink != 0 && srcInfo.Link == dstInfo.Link:
+		case srcInfo.IsDir != dstInfo.IsDir:
+			changed[path] = srcInfo
+		case srcInfo.IsDir && srcInfo.Mode != dstInfo.Mode:
+			changed[path] = srcInfo
+		case !srcInfo.IsDir && (srcInfo.Size != dstInfo.Size || srcInfo.Time != dstInfo.Time):
+			changed[path] = srcInfo
 		}
 	}
-
-	// Remove directories from changed list
-	traversed := make(map[string]bool)
-	for path := range changed {
-		dir := filepath.Dir(path)
-		for !traversed[dir] && dir != "." {
-			traversed[dir] = true
-			delete(changed, dir)
-			dir = filepath.Dir(dir)
+	for path, dstInfo := range dst {
+		if _, exists := src[path]; !exists {
+			deleted[path] = dstInfo
 		}
 	}
-
-	// Files that exist locally but not remotely -> deleted
-	for path, myInfo := range my {
-		if _, exists := remote[path]; !exists {
-			deleted[path] = myInfo
-		}
-	}
-
 	return changed, deleted
 }

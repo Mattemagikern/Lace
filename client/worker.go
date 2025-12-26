@@ -1,11 +1,12 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"time"
+	"sync"
 
 	"github.com/schollz/progressbar/v3"
 
@@ -14,183 +15,256 @@ import (
 	"github.com/mattemagikern/lace/protocol"
 )
 
-type DeleteOp struct {
-	remote bool
+const readWindow = 32
+
+type workerCtx struct {
+	c       *protocol.Connection
+	mkdir   *files.MkdirCache
+	pending chan<- pendingResp
+	dryrun  bool
+}
+
+type Op interface {
+	Execute(w *workerCtx) error
+}
+
+type writeOp struct {
+	meta       files.MetaData
+	localPath  string
+	remotePath string
+	progress   *progressbar.ProgressBar
+}
+
+func (o *writeOp) Execute(w *workerCtx) error {
+	logger := slog.Default()
+	meta := o.meta
+	meta.Path = o.remotePath
+
+	err := w.c.SendFile(files.ExpandPath(o.localPath), meta, o.progress)
+	if err != nil {
+		if errors.Is(err, protocol.ErrLocalFile) {
+			logger.Error(fmt.Sprintf("send file %s: %v", o.localPath, err))
+			if o.progress != nil {
+				o.progress.Add(int(meta.Size))
+			}
+			return nil
+		}
+		return fmt.Errorf("send file %s: %w", o.localPath, err)
+	}
+	if (meta.IsDir || meta.Mode&os.ModeSymlink != 0) && o.progress != nil {
+		o.progress.Add(int(meta.Size))
+	}
+	logger.Info(fmt.Sprintf("<-Write: path %s, size: %d, mode:%d", o.localPath, meta.Size, meta.Mode))
+	return nil
+}
+
+type readOp struct {
+	localPath  string
+	remotePath string
+	progress   *progressbar.ProgressBar
+}
+
+func (o *readOp) Execute(w *workerCtx) error {
+	if err := w.c.SendMessage(protocol.TypeRead, &protocol.ReadPayload{Path: o.remotePath}); err != nil {
+		return fmt.Errorf("send read req: %w", err)
+	}
+	w.pending <- pendingResp{kind: pendRead, localPath: o.localPath, progress: o.progress}
+	return nil
+}
+
+type deleteOp struct {
 	path   string
+	remote bool
 }
 
-type Fileop struct {
-	path        string
-	remote_path string
+func (o *deleteOp) Execute(w *workerCtx) error {
+	logger := slog.Default()
+	logger.Info(fmt.Sprintf("Delete-> path: %s", o.path))
+	if w.dryrun {
+		return nil
+	}
+	if o.remote {
+		if err := w.c.SendMessage(protocol.TypeDelete, &protocol.DeletePayload{Path: o.path}); err != nil {
+			return fmt.Errorf("send delete: %w", err)
+		}
+		return nil
+	}
+	if err := os.RemoveAll(o.path); err != nil {
+		logger.Error(fmt.Sprintf("delete file: %v", err))
+	}
+	return nil
 }
 
-type IndexOp struct {
+type indexOp struct {
 	path string
 	res  chan *files.FileIndex
 }
 
+func (o *indexOp) Execute(w *workerCtx) error {
+	if err := w.c.SendMessage(protocol.TypeIndex, &protocol.IndexPayload{Root: o.path}); err != nil {
+		o.res <- nil
+		return fmt.Errorf("send index req: %w", err)
+	}
+	w.pending <- pendingResp{kind: pendIndex, indexRes: o.res}
+	return nil
+}
+
 type WorkSet struct {
-	Progress *progressbar.ProgressBar
-
-	Index  chan IndexOp
-	Delete chan DeleteOp
-	Write  chan Fileop
-	Read   chan Fileop
+	done chan struct{}
+	Ops  chan Op
 }
 
-func (ws *WorkSet) RequestIndex(path string, res chan *files.FileIndex) {
-	ws.Index <- IndexOp{path, res}
+func MakeWorkSet(cachesize uint) *WorkSet {
+	return &WorkSet{
+		done: make(chan struct{}),
+		Ops:  make(chan Op, cachesize),
+	}
 }
 
-func (ws *WorkSet) WriteFile(local_path, remote_path string) {
-	ws.Write <- Fileop{local_path, remote_path}
+func (ws *WorkSet) SpawnWorkers(n int, remote, server_command string, pipe func(string, string) exec.Pipe, dryrun bool) {
+	var wg sync.WaitGroup
+	logger := slog.Default()
+	logger.Info(fmt.Sprintf("spawning %d workers...", n))
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p := pipe(remote, server_command)
+			if err := p.Open(); err != nil {
+				logger.Error(fmt.Sprintf("failed to open pipe: %v", err))
+				return
+			}
+			defer p.Close()
+			ws.Worker(p, dryrun)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(ws.done)
+	}()
 }
 
-func (ws *WorkSet) ReadFile(local_path, remote_path string) {
-	ws.Read <- Fileop{local_path, remote_path}
+func (ws *WorkSet) Wait() {
+	<-ws.done
 }
 
-func (ws *WorkSet) DeleteFile(path string, remote bool) {
-	ws.Delete <- DeleteOp{remote, path}
+func (ws *WorkSet) Submit(op Op) error {
+	select {
+	case <-ws.done:
+		return fmt.Errorf("workset closed")
+	case ws.Ops <- op:
+		return nil
+	}
+}
+
+func (ws *WorkSet) RequestIndex(path string, res chan *files.FileIndex) error {
+	return ws.Submit(&indexOp{path: path, res: res})
+}
+
+func (ws *WorkSet) WriteFile(meta files.MetaData, localPath, remotePath string, progress *progressbar.ProgressBar) error {
+	return ws.Submit(&writeOp{meta: meta, localPath: localPath, remotePath: remotePath, progress: progress})
+}
+
+func (ws *WorkSet) ReadFile(meta files.MetaData, localPath, remotePath string, progress *progressbar.ProgressBar) error {
+	return ws.Submit(&readOp{localPath: localPath, remotePath: remotePath, progress: progress})
+}
+
+func (ws *WorkSet) DeleteFile(path string, remote bool) error {
+	return ws.Submit(&deleteOp{path: path, remote: remote})
 }
 
 func (ws *WorkSet) Close() {
-	close(ws.Delete)
-	close(ws.Write)
-	close(ws.Read)
-	close(ws.Index)
+	close(ws.Ops)
 }
 
-func Worker(ws *WorkSet, pipe exec.Pipe, dryrun bool) {
-	del := ws.Delete
-	read := ws.Read
-	write := ws.Write
-	index := ws.Index
+type pendingKind int
 
+const (
+	pendRead pendingKind = iota
+	pendIndex
+)
+
+type pendingResp struct {
+	kind      pendingKind
+	localPath string
+	indexRes  chan *files.FileIndex
+	progress  *progressbar.ProgressBar
+}
+
+func (ws *WorkSet) Worker(pipe exec.Pipe, dryrun bool) {
 	c := protocol.NewConnection(pipe)
 	logger := slog.Default()
-	for del != nil || read != nil || write != nil || index != nil {
-		select {
-		case idx, ok := <-index:
-			if !ok {
-				index = nil
-				continue
-			}
-			logger.Info(fmt.Sprintf("remote index start:%v\n", time.Now()))
-			err := c.SendMessage(protocol.TypeIndex,
-				&protocol.IndexPayload{
-					Root: idx.path,
-				})
-			if err != nil {
-				logger.Error(fmt.Sprintf("Failed to request index response: %v", err))
-				idx.res <- nil
-				continue
-			}
+
+	pending := make(chan pendingResp, readWindow)
+	receiverDone := make(chan struct{})
+	var mkdir files.MkdirCache
+	connBroken := false
+
+	go func() {
+		defer close(receiverDone)
+		for p := range pending {
 			ty, payload, err := c.ReadMessage()
 			if err != nil {
-				logger.Error(fmt.Sprintf("remote index: Failed to read message: %v", err))
-				idx.res <- nil
+				logger.Error(fmt.Sprintf("receiver read err: %v", err))
+				if p.kind == pendIndex {
+					p.indexRes <- nil
+				}
 				continue
 			}
-			if ty != protocol.TypeIndex {
-				logger.Error("Out of sequence message type")
-				idx.res <- nil
-				continue
-			}
-			respkg, ok := payload.(*protocol.IndexPayload)
-			idx.res <- &respkg.Index
-			logger.Info(fmt.Sprintf("remote index end:%v\n", time.Now()))
-		case fp, ok := <-del:
-			if !ok {
-				del = nil
-				continue
-			}
-			logger.Info(fmt.Sprintf("Delete-> path: %s", fp.path))
-			if dryrun {
-				continue
-			}
-			if fp.remote {
-				err := c.SendMessage(protocol.TypeDelete, &protocol.DeletePayload{
-					Path: fp.path,
-				})
-				if err != nil {
-					logger.Error(fmt.Sprintf("write delete message err:%v", err))
+			switch p.kind {
+			case pendRead:
+				if ty != protocol.TypeWrite {
+					logger.Error(fmt.Sprintf("expected TypeWrite, got %v", ty))
 					continue
 				}
-			} else {
-				err := os.RemoveAll(fp.path)
-				if err != nil {
-					logger.Error(fmt.Sprintf("delete file err:%v", err))
+				wp := payload.(*protocol.WritePayload)
+				path := files.ExpandPath(p.localPath)
+				logger.Info("<-Write", "path", p.localPath, "size", wp.MetaData.Size, "mode", wp.MetaData.Mode)
+				var src io.Reader = c
+				if p.progress != nil {
+					src = io.TeeReader(c, p.progress)
+				}
+				if err := files.WriteFile(path, &wp.MetaData, src, &mkdir, dryrun); err != nil {
+					logger.Error(fmt.Sprintf("write %s: %v", path, err))
+				}
+			case pendIndex:
+				if ty != protocol.TypeIndex {
+					logger.Error(fmt.Sprintf("expected TypeIndex, got %v", ty))
+					p.indexRes <- nil
 					continue
 				}
-			}
-		case fp, ok := <-read:
-			if !ok {
-				read = nil
-				continue
-			}
-			err := c.SendMessage(protocol.TypeRead, &protocol.ReadPayload{
-				Path: fp.remote_path,
-			})
-			if err != nil {
-				logger.Error(fmt.Sprintf("make read message err: %v", err))
-				continue
-			}
-			ty, payload, err := c.ReadMessage()
-			if err != nil {
-				logger.Error(fmt.Sprintf("read message err:%v", err))
-				continue
-			}
-			if ty != protocol.TypeWrite {
-				logger.Error(fmt.Sprintf("unexpected response type got: %v", ty))
-				continue
-			}
-
-			wp := payload.(*protocol.WritePayload)
-			path := files.ExpandPath(fp.path)
-			logger.Info("<-Write", "path", fp.path, "size", wp.MetaData.Size, "mode", wp.MetaData.Mode)
-			if dryrun {
-				ws.Progress.Add(int(wp.MetaData.Size))
-				continue
-			}
-
-			if err := files.WriteFile(path, &wp.MetaData, io.MultiReader(c, ws.Progress)); err != nil {
-				logger.Error(fmt.Sprintf("Failed to write file:%v", err))
-			}
-		case fop, ok := <-write:
-			if !ok {
-				write = nil
-				continue
-			}
-			var wp protocol.WritePayload
-			var err error
-			path := files.ExpandPath(fop.path)
-
-			wp.MetaData, err = files.MakeMetaData(path)
-			if err != nil {
-				logger.Error(fmt.Sprintf("Failed to make metadata:%v", err))
-				return
-			}
-			wp.MetaData.Path = fop.remote_path
-
-			err = c.SendMessage(protocol.TypeWrite, &wp)
-			if err != nil {
-				logger.Error(fmt.Sprintf("write message error:%v", err))
-				return
-			}
-			logger.Info(fmt.Sprintf("<-Write: path %s, size: %d, mode:%d", fop.path, wp.MetaData.Size, wp.MetaData.Mode))
-			if (wp.MetaData.Mode&os.ModeDir) != 0 || wp.MetaData.Link != "" {
-				logger.Info("skipping data transfer for directory or symlink")
-				ws.Progress.Add(int(wp.MetaData.Size))
-				continue
-			}
-			if err := files.ReadFile(path, io.MultiWriter(c, ws.Progress)); err != nil {
-				logger.Error(fmt.Sprintf("Failed to write file:%v", err))
-				return
+				ip := payload.(*protocol.IndexPayload)
+				p.indexRes <- &ip.Index
 			}
 		}
+	}()
+
+	defer func() {
+		close(pending)
+		<-receiverDone
+		if !connBroken {
+			if err := c.Sync(); err != nil &&
+				!errors.Is(err, io.EOF) &&
+				!errors.Is(err, io.ErrUnexpectedEOF) &&
+				!errors.Is(err, io.ErrClosedPipe) {
+				logger.Error(fmt.Sprintf("sync error:%v", err))
+			}
+		}
+		c.Close()
+	}()
+
+	ctx := &workerCtx{
+		c:       c,
+		mkdir:   &mkdir,
+		pending: pending,
+		dryrun:  dryrun,
 	}
-	if err := c.Sync(); err != nil {
-		logger.Error(fmt.Sprintf("sync error:%v", err))
+
+	for op := range ws.Ops {
+		if err := op.Execute(ctx); err != nil {
+			logger.Error(fmt.Sprintf("op failed: %v", err))
+			connBroken = true
+			return
+		}
 	}
 }

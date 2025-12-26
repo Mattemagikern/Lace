@@ -6,7 +6,9 @@ import (
 	"os"
 	"runtime"
 	"strings"
-	"sync"
+	"time"
+
+	charmlog "github.com/charmbracelet/log"
 
 	"github.com/mattemagikern/lace/cfg"
 	"github.com/mattemagikern/lace/client"
@@ -16,52 +18,37 @@ import (
 	"github.com/mattemagikern/lace/server"
 )
 
-var (
-	logger = slog.New(slog.NewTextHandler(os.Stderr,
-		&slog.HandlerOptions{
-			Level: slog.LevelError,
-		}))
-	server_command = "lace --server"
-
-	numCPU    = runtime.NumCPU()
-	cacheSize = numCPU * 10
-	ws        = client.WorkSet{
-		Delete: make(chan client.DeleteOp, cacheSize),
-		Write:  make(chan client.Fileop, cacheSize),
-		Read:   make(chan client.Fileop, cacheSize),
-		Index:  make(chan client.IndexOp),
-	}
-)
-
-func spawnWorkers(n int, remote, server_command string, pipe func(string, string) exec.Pipe) *sync.WaitGroup {
-	var wg sync.WaitGroup
-	logger.Info(fmt.Sprintf("spawning %d workers...", n))
-	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			p := pipe(remote, server_command)
-			if err := p.Open(); err != nil {
-				logger.Error(fmt.Sprintf("failed to open pipe: %v", err))
-				return
-			}
-			defer p.Close()
-			client.Worker(&ws, p, cfg.Dryrun)
-		}()
-	}
-	return &wg
+func newLogger(level charmlog.Level) *slog.Logger {
+	return slog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+		Level:           level,
+		ReportTimestamp: true,
+		TimeFormat:      time.Kitchen,
+	}))
 }
 
+var (
+	logger         = newLogger(charmlog.ErrorLevel)
+	server_command = "lace --server"
+
+	numCPU    = runtime.NumCPU() * 2
+	cacheSize = numCPU * 5
+	ws        = client.MakeWorkSet(uint(cacheSize))
+)
+
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	args, err := cfg.Make()
 	if err != nil {
 		fmt.Println(err)
-		return
+		return 1
 	}
 
 	if cfg.Version {
 		fmt.Println(cfg.VERSION)
-		return
+		return 0
 	}
 
 	if cfg.Help {
@@ -69,10 +56,7 @@ func main() {
 	}
 
 	if cfg.Verbose {
-		logger = slog.New(slog.NewTextHandler(os.Stderr,
-			&slog.HandlerOptions{
-				Level: slog.LevelDebug,
-			}))
+		logger = newLogger(charmlog.DebugLevel)
 		server_command += " --verbose"
 	}
 	slog.SetDefault(logger)
@@ -87,33 +71,15 @@ func main() {
 		w := server.NewServer(exec.NewStdPipe(), cfg.Dryrun)
 		if err := w.Server(); err != nil {
 			logger.Error(fmt.Sprintf("%v", err))
+			return 1
 		}
 		logger.Info("server instance exiting...")
-		return
-	}
-
-	if cfg.Install {
-		if len(args) < 1 {
-			fmt.Println("remote destination required for install")
-			return
-		}
-		remote, dest := ssh.ParseDestination(args[0])
-		if dest == "" {
-			dest = "~/.local/bin/lace"
-		}
-
-		exePath, _ := os.Executable()
-		logger.Info(fmt.Sprintf("installing lace to %s:%s", remote, dest))
-		err := ssh.Upload(remote, exePath, dest)
-		if err != nil {
-			logger.Error(fmt.Sprintf("%v", err))
-		}
-		return
+		return 0
 	}
 
 	if len(args) < 2 {
 		fmt.Println("Not enough arguments")
-		return
+		return 1
 	}
 
 	from := args[0]
@@ -121,7 +87,7 @@ func main() {
 
 	if strings.Contains(from, ":") && strings.Contains(to, ":") {
 		logger.Error("both source and target cannot be remote")
-		return
+		return 1
 	}
 
 	push := true
@@ -144,23 +110,29 @@ func main() {
 		remote, dest = ssh.ParseDestination(remote)
 	}
 
-	if os.Lstat(src); err != nil {
+	if _, err := os.Lstat(src); err != nil {
 		fmt.Printf("source path does not exist: %s\n", from)
-		return
+		return 1
 	}
 
-	wg := spawnWorkers(cfg.Jobs, remote, server_command, pipe)
-	defer wg.Wait()
+	ws.SpawnWorkers(cfg.Jobs, remote, server_command, pipe, cfg.Dryrun)
+	defer ws.Wait()
 	defer ws.Close()
-	c, err := client.NewClient(src, dest, &ws)
+	c, err := client.NewClient(src, dest, ws)
 	if err != nil {
 		fmt.Printf("failed to create client: %v\n", err)
-		return
+		return 1
 	}
 
 	if push {
-		c.Push()
+		err = c.Push()
 	} else {
-		c.Pull()
+		err = c.Pull()
 	}
+
+	if err != nil {
+		fmt.Printf("file transfer failed: %v\n", err)
+		return 1
+	}
+	return 0
 }
