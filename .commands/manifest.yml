@@ -9,6 +9,7 @@
 #
 install:
   path: .commands/install
+  help: "Build lace and install locally, or to a remote SSH host (user@host[:port] [/remote/dest/path])"
 
 main:
   path: .commands/main

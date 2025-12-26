@@ -1,17 +1,27 @@
 #!/bin/bash
 
+set -e
+
 TIME=$(date +"%d/%m-%Y")
-VERSION=$(git describe --abbrev=0 2>/dev/null)
 if [ -z "$VERSION" ]; then
     VERSION=$(git log -1 --format=%h)
 fi
 
-set -e
-
-flags="-X main.TIME=${TIME} \
--X main.VERSION=${VERSION} -s -w"
+flags="-X github.com/mattemagikern/lace/cfg.TIME=${TIME} \
+-X github.com/mattemagikern/lace/cfg.VERSION=${VERSION} -s -w"
 
 go build -ldflags="$flags"
 
-mkdir -p ~/.local/bin
-mv lace ~/.local/bin/
+if [ $# -eq 0 ]; then
+    mkdir -p ~/.local/bin
+    mv lace ~/.local/bin/
+    exit 0
+fi
+
+REMOTE=$1
+DEST=${2:-/usr/local/bin/lace}
+
+echo "Installing lace to ${REMOTE}:${DEST}"
+scp lace "${REMOTE}:/tmp/lace.$$"
+ssh -t "$REMOTE" "sudo install -m 0755 /tmp/lace.$$ ${DEST} && rm -f /tmp/lace.$$"
+rm -f lace
