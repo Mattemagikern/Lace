@@ -1,0 +1,103 @@
+#!/bin/bash
+set -euo pipefail
+
+REMOTE="${TETHER_REMOTE:-workspace}"
+TARGET_DIR="${TETHER_TARGET:-/mnt/workspace/zephyr}"
+SYNC="${TETHER_SYNC:-lace}"
+LOCAL_DIR="${TETHER_LOCAL:-./}"
+
+RC="${TETHER_RC:-$(dirname "$(readlink -f "$0")")/.tetherrc}"
+[[ -f "$RC" ]] && source "$RC"
+
+REMOTE_PATH="$REMOTE:$TARGET_DIR"
+
+PUSH=true
+PULL=false
+EXEC=true
+DETACH=false
+ARGS=()
+
+usage() {
+	cat <<EOF
+Usage: tether [options] [--] <command...>
+
+Sync the local tree to a remote build host, run a command there, and
+optionally pull results back.
+
+Options are only recognized before the remote command. Everything from
+the first non-flag argument (or after '--') is passed through verbatim.
+
+Options:
+  --no-push       Skip the push step.
+  --pull          Pull the remote tree back after the command runs.
+  --no-exec       Sync only; do not run a command remotely.
+  --detach        Run the remote command inside a detached tmux session.
+  -h, --help      Show this help.
+
+Configuration (env vars or \$TETHER_RC, default ./.tetherrc):
+  TETHER_REMOTE   SSH host or alias        (current: $REMOTE)
+  TETHER_TARGET   Remote directory         (current: $TARGET_DIR)
+  TETHER_LOCAL    Local directory          (current: $LOCAL_DIR)
+  TETHER_SYNC     Sync backend: lace|rsync (current: $SYNC)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--no-push)  PUSH=false; shift ;;
+		--pull)     PULL=true;  shift ;;
+		--no-exec)  EXEC=false; shift ;;
+		--detach)   DETACH=true; shift ;;
+		-h|--help)  usage; exit 0 ;;
+		--)         shift; ARGS=("$@"); break ;;
+		*)          ARGS=("$@"); break ;;
+	esac
+done
+
+sync() {
+	local src="$1" dst="$2"
+	case "$SYNC" in
+		lace)
+			src="${src%/}"
+			dst="${dst%/}"
+			time lace "$src" "$dst"
+			;;
+		rsync)
+			# rsync needs a trailing slash on src to copy contents
+			# rather than the directory itself.
+			[[ "$src" == */ ]] || src="$src/"
+			time rsync -az --delete --inplace \
+				--info=progress2 --exclude='**/.git' \
+				"$src" "$dst"
+			;;
+		*)
+			echo "tether: unknown TETHER_SYNC backend: $SYNC" >&2
+			exit 2
+			;;
+	esac
+}
+
+rexec() {
+	ssh -t "$REMOTE" "bash -lc 'cd $(printf %q "$TARGET_DIR") && $1'"
+}
+
+if $EXEC && [[ ${#ARGS[@]} -eq 0 ]]; then
+	echo "tether: no command given (use --no-exec to sync only)" >&2
+	usage >&2
+	exit 1
+fi
+
+$PUSH && sync "$LOCAL_DIR" "$REMOTE_PATH"
+
+if $EXEC; then
+	cmd=$(printf '%q ' "${ARGS[@]}")
+	if $DETACH; then
+		session="tether-$(date +%s)-$$"
+		echo "tether: detaching as tmux session '$session'"
+		rexec "tmux new-session -d -s $(printf %q "$session") $cmd"
+		exit 0
+	fi
+	rexec "$cmd"
+fi
+
+$PULL && sync "$REMOTE_PATH" "$LOCAL_DIR"
