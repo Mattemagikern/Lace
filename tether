@@ -78,7 +78,7 @@ sync() {
 }
 
 rexec() {
-	ssh -t "$REMOTE" "bash -lc 'cd $(printf %q "$TARGET_DIR") && $1'"
+	ssh -t "$REMOTE" "bash -lc 'cd $(printf %q "$TARGET_DIR" | sed 's/\\~/~/g') && $1'"
 }
 
 if $EXEC && [[ ${#ARGS[@]} -eq 0 ]]; then
