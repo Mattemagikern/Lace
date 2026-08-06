@@ -192,3 +192,35 @@ client logic drives both local and remote transfers.
 Because the remote side is just ``lace`` invoked with ``--server``, the
 binary on both ends must match, keep them in sync when upgrading.
 
+Example use cases
+-----------------
+
+The ``tether`` script wraps lace to provide a push-build-pull workflow for
+remote execution / development.
+It syncs a local tree to a remote host, runs a command there, and optionally
+pulls the results back.
+In addition to the use cases mentioned below, see ``tether --help`` for more options.
+
+Push source to a build server and compile
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Push your local source tree to the remote host and run a build command:
+
+.. code-block:: bash
+
+        tether make -j8
+
+This runs ``lace`` to sync the current directory to the remote, then
+executes ``make -j8`` over SSH.
+
+Push, build, and pull results back
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``--pull`` to sync the remote tree back after the command finishes:
+
+.. code-block:: bash
+
+        tether --pull make -j8
+
+After the build completes, the updated remote tree (e.g. compiled objects,
+artifacts) is synced back to the local directory.
