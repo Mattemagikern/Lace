@@ -6,6 +6,9 @@ TARGET_DIR="${TETHER_TARGET:-/mnt/workspace/zephyr}"
 SYNC="${TETHER_SYNC:-lace}"
 LOCAL_DIR="${TETHER_LOCAL:-./}"
 
+IGNORE=()
+[[ -n "${TETHER_IGNORE:-}" ]] && read -ra IGNORE <<< "$TETHER_IGNORE"
+
 RC="${TETHER_RC:-$(dirname "$(readlink -f "$0")")/.tetherrc}"
 [[ -f "$RC" ]] && source "$RC"
 
@@ -32,6 +35,8 @@ Options:
   --pull          Pull the remote tree back after the command runs.
   --no-exec       Sync only; do not run a command remotely.
   --detach        Run the remote command inside a detached tmux session.
+  -i, --ignore <pat>
+                  Skip paths matching <pat>. May be given more than once.
   -h, --help      Show this help.
 
 Configuration (env vars or \$TETHER_RC, default ./.tetherrc):
@@ -39,6 +44,7 @@ Configuration (env vars or \$TETHER_RC, default ./.tetherrc):
   TETHER_TARGET   Remote directory         (current: $TARGET_DIR)
   TETHER_LOCAL    Local directory          (current: $LOCAL_DIR)
   TETHER_SYNC     Sync backend: lace|rsync (current: $SYNC)
+  TETHER_IGNORE   Space-separated patterns (current: ${IGNORE[*]-})
 EOF
 }
 
@@ -48,6 +54,7 @@ while [[ $# -gt 0 ]]; do
 		--pull)     PULL=true;  shift ;;
 		--no-exec)  EXEC=false; shift ;;
 		--detach)   DETACH=true; shift ;;
+		-i|--ignore) IGNORE+=("${2:?--ignore requires a pattern}"); shift 2 ;;
 		-h|--help)  usage; exit 0 ;;
 		--)         shift; ARGS=("$@"); break ;;
 		*)          ARGS=("$@"); break ;;
@@ -55,20 +62,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 sync() {
-	local src="$1" dst="$2"
+	local src="$1" dst="$2" p ign=()
 	case "$SYNC" in
 		lace)
 			src="${src%/}"
 			dst="${dst%/}"
-			time lace "$src" "$dst"
+			for p in ${IGNORE[@]+"${IGNORE[@]}"}; do ign+=(--ignore "$p"); done
+			time lace ${ign[@]+"${ign[@]}"} "$src" "$dst"
 			;;
 		rsync)
 			# rsync needs a trailing slash on src to copy contents
 			# rather than the directory itself.
 			[[ "$src" == */ ]] || src="$src/"
+			for p in ${IGNORE[@]+"${IGNORE[@]}"}; do ign+=(--exclude "$p"); done
 			time rsync -az --delete --inplace \
-				--info=progress2 --exclude='**/.git' \
-				"$src" "$dst"
+				--info=progress2 \
+				${ign[@]+"${ign[@]}"} "$src" "$dst"
 			;;
 		*)
 			echo "tether: unknown TETHER_SYNC backend: $SYNC" >&2
@@ -87,7 +96,9 @@ if $EXEC && [[ ${#ARGS[@]} -eq 0 ]]; then
 	exit 1
 fi
 
-$PUSH && sync "$LOCAL_DIR" "$REMOTE_PATH"
+if $PUSH; then
+	sync "$LOCAL_DIR" "$REMOTE_PATH"
+fi
 
 if $EXEC; then
 	cmd=$(printf '%q ' "${ARGS[@]}")
@@ -100,4 +111,6 @@ if $EXEC; then
 	rexec "$cmd"
 fi
 
-$PULL && sync "$REMOTE_PATH" "$LOCAL_DIR"
+if $PULL; then
+	sync "$REMOTE_PATH" "$LOCAL_DIR"
+fi

@@ -15,6 +15,7 @@ import (
 	"github.com/mattemagikern/lace/exec"
 	"github.com/mattemagikern/lace/exec/osexec"
 	"github.com/mattemagikern/lace/exec/ssh"
+	"github.com/mattemagikern/lace/files"
 	"github.com/mattemagikern/lace/server"
 )
 
@@ -60,6 +61,11 @@ func run() int {
 		server_command += " --verbose"
 	}
 	slog.SetDefault(logger)
+
+	if _, err := files.NewMatcher(cfg.Ignore); err != nil {
+		fmt.Println(err)
+		return 1
+	}
 
 	if cfg.Dryrun {
 		logger.Info("performing dry run...")
@@ -118,7 +124,7 @@ func run() int {
 	ws.SpawnWorkers(cfg.Jobs, remote, server_command, pipe, cfg.Dryrun)
 	defer ws.Wait()
 	defer ws.Close()
-	c, err := client.NewClient(src, dest, ws)
+	c, err := client.NewClient(src, dest, ws, cfg.Ignore)
 	if err != nil {
 		fmt.Printf("failed to create client: %v\n", err)
 		return 1
