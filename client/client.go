@@ -20,9 +20,12 @@ type Client struct {
 	remote_index files.FileIndex
 }
 
-func NewClient(root, remote_root string, ws *WorkSet) (*Client, error) {
-	var err error
+func NewClient(root, remote_root string, ws *WorkSet, ignore []string) (*Client, error) {
 	logger := slog.Default()
+	ig, err := files.NewMatcher(ignore)
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
 		root:        root,
 		remote_root: remote_root,
@@ -30,10 +33,10 @@ func NewClient(root, remote_root string, ws *WorkSet) (*Client, error) {
 	}
 
 	res := make(chan *files.FileIndex)
-	go ws.RequestIndex(c.remote_root, res)
+	go ws.RequestIndex(c.remote_root, ignore, res)
 
 	logger.Info(fmt.Sprintf("local index start:%v\n", time.Now()))
-	c.index, err = files.MakeIndex(c.root)
+	c.index, err = files.MakeIndex(c.root, ig)
 	if err != nil {
 		c.index = make(files.FileIndex)
 	}

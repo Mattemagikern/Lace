@@ -96,12 +96,13 @@ func (o *deleteOp) Execute(w *workerCtx) error {
 }
 
 type indexOp struct {
-	path string
-	res  chan *files.FileIndex
+	path   string
+	ignore []string
+	res    chan *files.FileIndex
 }
 
 func (o *indexOp) Execute(w *workerCtx) error {
-	if err := w.c.SendMessage(protocol.TypeIndex, &protocol.IndexPayload{Root: o.path}); err != nil {
+	if err := w.c.SendMessage(protocol.TypeIndex, &protocol.IndexPayload{Root: o.path, Ignore: o.ignore}); err != nil {
 		o.res <- nil
 		return fmt.Errorf("send index req: %w", err)
 	}
@@ -157,8 +158,8 @@ func (ws *WorkSet) Submit(op Op) error {
 	}
 }
 
-func (ws *WorkSet) RequestIndex(path string, res chan *files.FileIndex) error {
-	return ws.Submit(&indexOp{path: path, res: res})
+func (ws *WorkSet) RequestIndex(path string, ignore []string, res chan *files.FileIndex) error {
+	return ws.Submit(&indexOp{path: path, ignore: ignore, res: res})
 }
 
 func (ws *WorkSet) WriteFile(meta files.MetaData, localPath, remotePath string, progress *progressbar.ProgressBar) error {

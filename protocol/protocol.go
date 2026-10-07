@@ -44,8 +44,9 @@ type ReadPayload struct {
 }
 
 type IndexPayload struct {
-	Root  string
-	Index files.FileIndex
+	Root   string
+	Ignore []string
+	Index  files.FileIndex
 }
 
 type SyncPayload struct {

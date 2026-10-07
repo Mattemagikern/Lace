@@ -64,7 +64,13 @@ func (w *Server) handleIndex(payload interface{}) error {
 	logger := slog.Default()
 	logger.Info(fmt.Sprintf("Index request received:%v", time.Now()))
 	idx := payload.(*protocol.IndexPayload)
-	idx.Index, _ = files.MakeIndex(idx.Root)
+	ig, err := files.NewMatcher(idx.Ignore)
+	if err != nil {
+		logger.Error(fmt.Sprintf("invalid ignore pattern: %v", err))
+		idx.Index = make(files.FileIndex)
+	} else {
+		idx.Index, _ = files.MakeIndex(idx.Root, ig)
+	}
 	if err := w.c.SendMessage(protocol.TypeIndex, idx); err != nil {
 		logger.Error(fmt.Sprintf("send index response: %v", err))
 		return err
