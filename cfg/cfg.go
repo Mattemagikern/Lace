@@ -3,8 +3,8 @@ package cfg
 import (
 	"fmt"
 	"os"
-	"strings"
 	"runtime"
+	"strings"
 
 	"github.com/Mattemagikern/flags"
 )
@@ -17,9 +17,10 @@ var (
 	Server         = false
 	Help           = false
 	Dryrun         = false
-	Jobs 	 	= runtime.NumCPU()
-	
-	f              = flags.NewFlagSet()
+	Jobs           = runtime.NumCPU()
+	Ignore  []string
+
+	f = flags.NewFlagSet()
 )
 
 func Make() ([]string, error) {
@@ -29,6 +30,7 @@ func Make() ([]string, error) {
 	f.SetFlag(&Dryrun, flags.Key{"", "--dryrun"}, "performs a dry run, no changes made")
 	f.SetFlag(&Server, flags.Key{"", "--server"}, "starts server instance")
 	f.SetFlag(&Jobs, flags.Key{"-j", "--jobs"}, "number of concurrent file transfers (default numcpu)")
+	f.SetFlag(&Ignore, flags.Key{"-i", "--ignore"}, "skip paths matching pattern (repeatable)")
 
 	args, err := f.Parse(os.Args[1:])
 	if err != nil {

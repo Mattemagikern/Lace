@@ -19,12 +19,18 @@ type MetaData struct {
 
 type FileIndex map[string]MetaData
 
-func walkSubtree(root, sub string, out chan<- MetaData) error {
+func walkSubtree(root, sub string, ig *Matcher, out chan<- MetaData) error {
 	return filepath.WalkDir(sub, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		rel, _ := filepath.Rel(root, path)
+		if ig.Match(filepath.ToSlash(rel), d.IsDir()) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			return err
@@ -45,7 +51,7 @@ func walkSubtree(root, sub string, out chan<- MetaData) error {
 	})
 }
 
-func MakeIndex(root string) (FileIndex, error) {
+func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
 	root = ExpandPath(root)
 	idx := make(FileIndex)
 
@@ -57,7 +63,7 @@ func MakeIndex(root string) (FileIndex, error) {
 		out := make(chan MetaData, 1)
 		go func() {
 			defer close(out)
-			walkSubtree(root, root, out)
+			walkSubtree(root, root, ig, out)
 		}()
 		for m := range out {
 			idx[m.Path] = m
@@ -79,13 +85,16 @@ func MakeIndex(root string) (FileIndex, error) {
 	var errMu sync.Mutex
 
 	for _, e := range entries {
+		if ig.Match(e.Name(), e.IsDir()) {
+			continue
+		}
 		sub := filepath.Join(root, e.Name())
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := walkSubtree(root, sub, out); err != nil {
+			if err := walkSubtree(root, sub, ig, out); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err

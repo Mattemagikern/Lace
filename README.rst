@@ -173,12 +173,39 @@ Options
 ============================  ===========================================
 ``-v``, ``--verbose``         Enable debug logging.
 ``-j``, ``--jobs <n>``        Number of concurrent transfer workers.
+``-i``, ``--ignore <pat>``    Skip paths matching ``pat``. May be given
+                              more than once.
 ``--dryrun``                  Simulate the transfer; make no changes.
 ``--server``                  Run as a server instance (used internally
                               by the client over SSH).
 ``--version``                 Print version and exit.
 ``-h``, ``--help``            Print help and exit.
 ============================  ===========================================
+
+Ignore patterns
+---------------
+
+Patterns are matched against paths relative to the transfer root, one path
+segment at a time, using shell globs (``*``, ``?``, ``[...]``). A trailing
+``/`` restricts the match to directories; a leading ``/`` anchors it to the
+root. A pattern containing an interior ``/`` is anchored implicitly.
+
+============================  ===========================================
+``.git/``                     Any directory named ``.git``, at any depth.
+``/.git/``                    Only ``<root>/.git``.
+``.git``                      Any file *or* directory named ``.git``.
+``*.o``                       Any ``.o`` file, at any depth.
+``build/obj/``                Only ``<root>/build/obj``.
+============================  ===========================================
+
+.. code-block:: bash
+
+        lace --ignore .git/ --ignore '*.o' ./src user@host:22:/srv/app
+
+Ignored directories are pruned during the walk, so their contents are never
+stat'd or sent. The same patterns are applied to both sides of the
+transfer, which means ignored paths on the destination are left untouched
+rather than deleted.
 
 How it works
 ------------
