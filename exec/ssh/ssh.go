@@ -17,24 +17,62 @@ var (
 	clients   = map[string]*ssh.Client{}
 )
 
-func sharedClient(remote string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+func sharedClient(remote string, cfg *ssh.ClientConfig, chain []hop) (*ssh.Client, error) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
-	if c, ok := clients[remote]; ok {
+	key := clientKey(remote, chain)
+	if c, ok := clients[key]; ok {
 		return c, nil
 	}
-	c, err := ssh.Dial("tcp", remote, cfg)
+	c, err := dialChain(remote, cfg, chain)
 	if err != nil {
 		return nil, err
 	}
-	clients[remote] = c
+	clients[key] = c
 	return c, nil
+}
+
+func clientKey(remote string, chain []hop) string {
+	key := remote
+	for _, h := range chain {
+		key = h.remote + "|" + key
+	}
+	return key
+}
+
+func dialChain(remote string, cfg *ssh.ClientConfig, chain []hop) (*ssh.Client, error) {
+	if len(chain) == 0 {
+		return ssh.Dial("tcp", remote, cfg)
+	}
+
+	client, err := ssh.Dial("tcp", chain[0].remote, chain[0].cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	hops := make([]hop, 0, len(chain))
+	hops = append(hops, chain[1:]...)
+	hops = append(hops, hop{remote: remote, cfg: cfg})
+	for _, h := range hops {
+		conn, err := client.Dial("tcp", h.remote)
+		if err != nil {
+			return nil, err
+		}
+		ncc, chans, reqs, err := ssh.NewClientConn(conn, h.remote, h.cfg)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		client = ssh.NewClient(ncc, chans, reqs)
+	}
+	return client, nil
 }
 
 type SSH struct {
 	remote  string
 	command string
 	ssh_cfg *ssh.ClientConfig
+	chain   []hop
 
 	client  *ssh.Client
 	session *ssh.Session
@@ -84,15 +122,17 @@ func NewPipe(target string, command string) exec.Pipe {
 		}
 	}
 
+	chain, _ := proxyChain(hostAddress)
 	return &SSH{
 		ssh_cfg: cfg,
 		remote:  remote,
 		command: command,
+		chain:   chain,
 	}
 }
 
 func (peer *SSH) Open() error {
-	client, err := sharedClient(peer.remote, peer.ssh_cfg)
+	client, err := sharedClient(peer.remote, peer.ssh_cfg, peer.chain)
 	if err != nil {
 		return err
 	}

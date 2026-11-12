@@ -23,6 +23,7 @@ type SSHConfig struct {
 	User         string
 	Port         string
 	IdentityFile []string
+	ProxyJump    string
 }
 
 func parseIdentityFiles(identities []string) []ssh.AuthMethod {
@@ -95,6 +96,8 @@ func parseSSHConfig(sshconfig []byte) (map[string]*SSHConfig, error) {
 				current.Port = value
 			case "identityfile":
 				current.IdentityFile = append(current.IdentityFile, files.ExpandPath(value))
+			case "proxyjump":
+				current.ProxyJump = value
 			}
 		}
 	}
@@ -175,6 +178,41 @@ func expandHostAddress(hostAddress, port string) string {
 		port = "22"
 	}
 	return fmt.Sprintf("%s:%s", hostAddress, port)
+}
+
+type hop struct {
+	remote string
+	cfg    *ssh.ClientConfig
+}
+
+func proxyChain(hostAddress string) ([]hop, error) {
+	configs, err := getConfigs()
+	if err != nil {
+		return nil, nil
+	}
+	conf, ok := configs[hostAddress]
+	if !ok || conf.ProxyJump == "" || strings.EqualFold(conf.ProxyJump, "none") {
+		return nil, nil
+	}
+
+	var hops []hop
+	for _, entry := range strings.Split(conf.ProxyJump, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		user, host, port := parseSSHAddr(entry)
+		remote := expandHostAddress(host, port)
+		cfg, err := MakeSSHConfig(host)
+		if err != nil {
+			return nil, err
+		}
+		if user != "" {
+			cfg.User = user
+		}
+		hops = append(hops, hop{remote: remote, cfg: cfg})
+	}
+	return hops, nil
 }
 
 var (
