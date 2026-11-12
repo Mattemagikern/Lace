@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 type MetaData struct {
@@ -19,36 +21,148 @@ type MetaData struct {
 
 type FileIndex map[string]MetaData
 
-func walkSubtree(root, sub string, ig *Matcher, out chan<- MetaData) error {
-	return filepath.WalkDir(sub, func(path string, d fs.DirEntry, err error) error {
+func (idx FileIndex) EncodeMsgpack(enc *msgpack.Encoder) error {
+	if err := enc.EncodeMapLen(len(idx)); err != nil {
+		return err
+	}
+	for path, m := range idx {
+		if err := enc.EncodeString(path); err != nil {
+			return err
+		}
+		if err := enc.EncodeArrayLen(4); err != nil {
+			return err
+		}
+		if err := enc.EncodeInt(m.Size); err != nil {
+			return err
+		}
+		if err := enc.EncodeUint(uint64(m.Mode)); err != nil {
+			return err
+		}
+		if err := enc.EncodeInt(m.Time); err != nil {
+			return err
+		}
+		if err := enc.EncodeString(m.Link); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (idx *FileIndex) DecodeMsgpack(dec *msgpack.Decoder) error {
+	n, err := dec.DecodeMapLen()
+	if err != nil {
+		return err
+	}
+	out := make(FileIndex, n)
+	for range n {
+		path, err := dec.DecodeString()
 		if err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(root, path)
-		if ig.Match(filepath.ToSlash(rel), d.IsDir()) {
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
+		if _, err := dec.DecodeArrayLen(); err != nil {
+			return err
 		}
-		info, err := d.Info()
+		size, err := dec.DecodeInt64()
 		if err != nil {
 			return err
 		}
-		link := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, _ = os.Readlink(path)
+		mode, err := dec.DecodeUint32()
+		if err != nil {
+			return err
 		}
-		out <- MetaData{
-			Path:  rel,
-			Size:  info.Size(),
-			Mode:  info.Mode(),
-			IsDir: d.IsDir(),
-			Time:  info.ModTime().Unix(),
+		t, err := dec.DecodeInt64()
+		if err != nil {
+			return err
+		}
+		link, err := dec.DecodeString()
+		if err != nil {
+			return err
+		}
+		fm := os.FileMode(mode)
+		out[path] = MetaData{
+			Path:  path,
+			Size:  size,
+			Mode:  fm,
+			IsDir: fm.IsDir(),
+			Time:  t,
 			Link:  link,
 		}
-		return nil
-	})
+	}
+	*idx = out
+	return nil
+}
+
+func emitEntry(root, path string, d fs.DirEntry, out chan<- MetaData) error {
+	rel, _ := filepath.Rel(root, path)
+	info, err := d.Info()
+	if err != nil {
+		return err
+	}
+	link := ""
+	if info.Mode()&os.ModeSymlink != 0 {
+		link, _ = os.Readlink(path)
+	}
+	out <- MetaData{
+		Path:  rel,
+		Size:  info.Size(),
+		Mode:  info.Mode(),
+		IsDir: d.IsDir(),
+		Time:  info.ModTime().Unix(),
+		Link:  link,
+	}
+	return nil
+}
+
+type walkState struct {
+	root     string
+	ig       *Matcher
+	out      chan<- MetaData
+	sem      chan struct{}
+	wg       sync.WaitGroup
+	errMu    sync.Mutex
+	firstErr error
+}
+
+func (s *walkState) fail(err error) {
+	s.errMu.Lock()
+	if s.firstErr == nil {
+		s.firstErr = err
+	}
+	s.errMu.Unlock()
+}
+
+func (s *walkState) walk(dir string) {
+	defer s.wg.Done()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		s.fail(err)
+		return
+	}
+
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		rel, _ := filepath.Rel(s.root, path)
+		if s.ig.Match(filepath.ToSlash(rel), e.IsDir()) {
+			continue
+		}
+		if err := emitEntry(s.root, path, e, s.out); err != nil {
+			s.fail(err)
+			continue
+		}
+		if e.IsDir() {
+			s.wg.Add(1)
+			select {
+			case s.sem <- struct{}{}:
+				go func(sub string) {
+					defer func() { <-s.sem }()
+					s.walk(sub)
+				}(path)
+			default:
+				s.walk(path)
+			}
+		}
+	}
 }
 
 func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
@@ -60,52 +174,34 @@ func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
 		return nil, err
 	}
 	if !info.IsDir() {
-		out := make(chan MetaData, 1)
-		go func() {
-			defer close(out)
-			walkSubtree(root, root, ig, out)
-		}()
-		for m := range out {
-			idx[m.Path] = m
+		if !ig.Match(".", false) {
+			out := make(chan MetaData, 1)
+			go func() {
+				defer close(out)
+				emitEntry(root, root, fs.FileInfoToDirEntry(info), out)
+			}()
+			for m := range out {
+				idx[m.Path] = m
+			}
 		}
 		return idx, nil
 	}
 
 	idx["."] = MetaData{Path: ".", IsDir: true, Mode: os.ModeDir}
 
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return idx, err
-	}
-
 	out := make(chan MetaData, 1024)
-	sem := make(chan struct{}, runtime.NumCPU())
-	var wg sync.WaitGroup
-	var firstErr error
-	var errMu sync.Mutex
-
-	for _, e := range entries {
-		if ig.Match(e.Name(), e.IsDir()) {
-			continue
-		}
-		sub := filepath.Join(root, e.Name())
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if err := walkSubtree(root, sub, ig, out); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-			}
-		}()
+	s := &walkState{
+		root: root,
+		ig:   ig,
+		out:  out,
+		sem:  make(chan struct{}, runtime.NumCPU()),
 	}
+
+	s.wg.Add(1)
+	go s.walk(root)
 
 	go func() {
-		wg.Wait()
+		s.wg.Wait()
 		close(out)
 	}()
 
@@ -113,7 +209,7 @@ func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
 		idx[m.Path] = m
 	}
 
-	return idx, firstErr
+	return idx, s.firstErr
 }
 
 func FilterFiles(src, dst FileIndex) (changed, deleted FileIndex) {
