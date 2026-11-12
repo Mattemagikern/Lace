@@ -126,11 +126,15 @@ func run() int {
 		return 1
 	}
 
+	st := client.NewStatus(os.Stderr)
+	defer st.Clear()
+
 	ws.SpawnWorkers(cfg.Jobs, remote, server_command, pipe, cfg.Dryrun)
 	defer ws.Wait()
 	defer ws.Close()
-	c, err := client.NewClient(src, dest, ws, cfg.Ignore)
+	c, err := client.NewClient(src, dest, ws, cfg.Ignore, st)
 	if err != nil {
+		st.Clear()
 		fmt.Printf("failed to create client: %v\n", err)
 		return 1
 	}
@@ -142,6 +146,7 @@ func run() int {
 	}
 
 	if err != nil {
+		st.Clear()
 		fmt.Printf("file transfer failed: %v\n", err)
 		return 1
 	}

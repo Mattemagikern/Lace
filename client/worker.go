@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/schollz/progressbar/v3"
 
@@ -115,13 +116,38 @@ type WorkSet struct {
 	Ops  chan Op
 
 	mkdir files.MkdirCache
+
+	connected chan struct{}
+	connOnce  sync.Once
+	connOK    atomic.Bool
+	connErr   atomic.Pointer[error]
+	errOnce   sync.Once
 }
 
 func MakeWorkSet(cachesize uint) *WorkSet {
 	return &WorkSet{
-		done: make(chan struct{}),
-		Ops:  make(chan Op, cachesize),
+		done:      make(chan struct{}),
+		Ops:       make(chan Op, cachesize),
+		connected: make(chan struct{}),
 	}
+}
+
+func (ws *WorkSet) Connected() <-chan struct{} {
+	return ws.connected
+}
+
+func (ws *WorkSet) Done() <-chan struct{} {
+	return ws.done
+}
+
+func (ws *WorkSet) ConnError() error {
+	if ws.connOK.Load() {
+		return nil
+	}
+	if e := ws.connErr.Load(); e != nil {
+		return *e
+	}
+	return nil
 }
 
 func (ws *WorkSet) SpawnWorkers(n int, remote, server_command string, pipe func(string, string) exec.Pipe, dryrun bool) {
@@ -135,14 +161,18 @@ func (ws *WorkSet) SpawnWorkers(n int, remote, server_command string, pipe func(
 			p := pipe(remote, server_command)
 			if err := p.Open(); err != nil {
 				logger.Error(fmt.Sprintf("failed to open pipe: %v", err))
+				ws.errOnce.Do(func() { ws.connErr.Store(&err) })
 				return
 			}
+			ws.connOK.Store(true)
+			ws.connOnce.Do(func() { close(ws.connected) })
 			defer p.Close()
 			ws.Worker(p, dryrun)
 		}()
 	}
 	go func() {
 		wg.Wait()
+		ws.connOnce.Do(func() { close(ws.connected) })
 		close(ws.done)
 	}()
 }

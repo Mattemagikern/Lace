@@ -16,11 +16,12 @@ type Client struct {
 	remote_root string
 
 	ws           *WorkSet
+	st           *Status
 	index        files.FileIndex
 	remote_index files.FileIndex
 }
 
-func NewClient(root, remote_root string, ws *WorkSet, ignore []string) (*Client, error) {
+func NewClient(root, remote_root string, ws *WorkSet, ignore []string, st *Status) (*Client, error) {
 	logger := slog.Default()
 	ig, err := files.NewMatcher(ignore)
 	if err != nil {
@@ -30,10 +31,34 @@ func NewClient(root, remote_root string, ws *WorkSet, ignore []string) (*Client,
 		root:        root,
 		remote_root: remote_root,
 		ws:          ws,
+		st:          st,
 	}
 
-	res := make(chan *files.FileIndex)
-	go ws.RequestIndex(c.remote_root, ignore, res)
+	st.Set("Connecting...")
+	stop, watch := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watch)
+		select {
+		case <-ws.Connected():
+			if ws.ConnError() != nil {
+				st.Set("Connection failed")
+			} else {
+				st.Set("Indexing...")
+			}
+		case <-stop:
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-watch
+	}()
+
+	res := make(chan *files.FileIndex, 1)
+	go func() {
+		if err := ws.RequestIndex(c.remote_root, ignore, res); err != nil {
+			res <- nil
+		}
+	}()
 
 	logger.Info(fmt.Sprintf("local index start:%v\n", time.Now()))
 	c.index, err = files.MakeIndex(c.root, ig)
@@ -41,8 +66,20 @@ func NewClient(root, remote_root string, ws *WorkSet, ignore []string) (*Client,
 		c.index = make(files.FileIndex)
 	}
 	logger.Info(fmt.Sprintf("local index end:%v\n", time.Now()))
-	remote_index := <-res
+
+	var remote_index *files.FileIndex
+	select {
+	case remote_index = <-res:
+	case <-ws.Done():
+		select {
+		case remote_index = <-res:
+		default:
+		}
+	}
 	if remote_index == nil {
+		if cerr := ws.ConnError(); cerr != nil {
+			return nil, fmt.Errorf("failed to connect: %w", cerr)
+		}
 		return nil, fmt.Errorf("Failed to get remote index")
 	}
 	c.remote_index = *remote_index
@@ -59,17 +96,21 @@ func sortedKeys(idx files.FileIndex) []string {
 }
 
 func (c *Client) Push() error {
+	c.st.Set("Comparing...")
 	changed, deleted := files.FilterFiles(c.index, c.remote_index)
+	c.st.Clear()
 	fmt.Printf("Changed files: %d, Deleted files: %d \n", len(changed), len(deleted))
 	if (len(changed) + len(deleted)) == 0 {
 		return nil
 	}
 
+	c.st.Set("Deleting...")
 	for _, path := range sortedKeys(deleted) {
 		if err := c.ws.DeleteFile(filepath.Join(c.remote_root, path), true); err != nil {
 			return err
 		}
 	}
+	c.st.Clear()
 
 	byteCount := 0
 	for _, k := range changed {
@@ -96,17 +137,21 @@ func (c *Client) Push() error {
 }
 
 func (c *Client) Pull() error {
+	c.st.Set("Comparing...")
 	changed, deleted := files.FilterFiles(c.remote_index, c.index)
+	c.st.Clear()
 	fmt.Printf("Changed files: %d, Deleted files: %d \n", len(changed), len(deleted))
 	if (len(changed) + len(deleted)) == 0 {
 		return nil
 	}
 
+	c.st.Set("Deleting...")
 	for _, p := range sortedKeys(deleted) {
 		if err := c.ws.DeleteFile(filepath.Join(c.root, p), false); err != nil {
 			return err
 		}
 	}
+	c.st.Clear()
 
 	byteCount := 0
 	for _, k := range changed {
