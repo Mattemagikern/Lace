@@ -116,8 +116,13 @@ func run() int {
 		remote, dest = ssh.ParseDestination(remote)
 	}
 
-	if _, err := os.Lstat(src); err != nil {
-		fmt.Printf("source path does not exist: %s\n", from)
+	if push {
+		if _, err := os.Lstat(src); err != nil {
+			fmt.Printf("source path does not exist: %s\n", from)
+			return 1
+		}
+	} else if err := os.MkdirAll(src, 0o755); err != nil {
+		fmt.Printf("failed to create destination: %s\n", dest)
 		return 1
 	}
 

@@ -113,6 +113,8 @@ func (o *indexOp) Execute(w *workerCtx) error {
 type WorkSet struct {
 	done chan struct{}
 	Ops  chan Op
+
+	mkdir files.MkdirCache
 }
 
 func MakeWorkSet(cachesize uint) *WorkSet {
@@ -198,7 +200,6 @@ func (ws *WorkSet) Worker(pipe exec.Pipe, dryrun bool) {
 
 	pending := make(chan pendingResp, readWindow)
 	receiverDone := make(chan struct{})
-	var mkdir files.MkdirCache
 	connBroken := false
 
 	go func() {
@@ -225,7 +226,7 @@ func (ws *WorkSet) Worker(pipe exec.Pipe, dryrun bool) {
 				if p.progress != nil {
 					src = io.TeeReader(c, p.progress)
 				}
-				if err := files.WriteFile(path, &wp.MetaData, src, &mkdir, dryrun); err != nil {
+				if err := files.WriteFile(path, &wp.MetaData, src, &ws.mkdir, dryrun); err != nil {
 					logger.Error(fmt.Sprintf("write %s: %v", path, err))
 				}
 			case pendIndex:
@@ -256,7 +257,7 @@ func (ws *WorkSet) Worker(pipe exec.Pipe, dryrun bool) {
 
 	ctx := &workerCtx{
 		c:       c,
-		mkdir:   &mkdir,
+		mkdir:   &ws.mkdir,
 		pending: pending,
 		dryrun:  dryrun,
 	}

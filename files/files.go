@@ -22,17 +22,28 @@ func getBuf() *[]byte  { return bufPool.Get().(*[]byte) }
 func putBuf(p *[]byte) { bufPool.Put(p) }
 
 type MkdirCache struct {
-	last string
+	mu   sync.Mutex
+	seen map[string]struct{}
 }
 
 func (m *MkdirCache) Ensure(dir string) error {
-	if m.last == dir {
+	m.mu.Lock()
+	if _, ok := m.seen[dir]; ok {
+		m.mu.Unlock()
 		return nil
 	}
+	m.mu.Unlock()
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	m.last = dir
+
+	m.mu.Lock()
+	if m.seen == nil {
+		m.seen = make(map[string]struct{})
+	}
+	m.seen[dir] = struct{}{}
+	m.mu.Unlock()
 	return nil
 }
 
