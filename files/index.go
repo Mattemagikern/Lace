@@ -92,8 +92,7 @@ func (idx *FileIndex) DecodeMsgpack(dec *msgpack.Decoder) error {
 	return nil
 }
 
-func emitEntry(root, path string, d fs.DirEntry, out chan<- MetaData) error {
-	rel, _ := filepath.Rel(root, path)
+func emitEntry(rel, path string, d fs.DirEntry, out chan<- MetaData) error {
 	info, err := d.Info()
 	if err != nil {
 		return err
@@ -123,6 +122,15 @@ type walkState struct {
 	firstErr error
 }
 
+func (s *walkState) rel(path string) string {
+	n := len(s.root)
+	if len(path) > n+1 && path[:n] == s.root && os.IsPathSeparator(path[n]) {
+		return path[n+1:]
+	}
+	rel, _ := filepath.Rel(s.root, path)
+	return rel
+}
+
 func (s *walkState) fail(err error) {
 	s.errMu.Lock()
 	if s.firstErr == nil {
@@ -142,11 +150,11 @@ func (s *walkState) walk(dir string) {
 
 	for _, e := range entries {
 		path := filepath.Join(dir, e.Name())
-		rel, _ := filepath.Rel(s.root, path)
+		rel := s.rel(path)
 		if s.ig.Match(filepath.ToSlash(rel), e.IsDir()) {
 			continue
 		}
-		if err := emitEntry(s.root, path, e, s.out); err != nil {
+		if err := emitEntry(rel, path, e, s.out); err != nil {
 			s.fail(err)
 			continue
 		}
@@ -166,7 +174,7 @@ func (s *walkState) walk(dir string) {
 }
 
 func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
-	root = ExpandPath(root)
+	root = filepath.Clean(ExpandPath(root))
 	idx := make(FileIndex)
 
 	info, err := os.Lstat(root)
@@ -178,7 +186,7 @@ func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
 			out := make(chan MetaData, 1)
 			go func() {
 				defer close(out)
-				emitEntry(root, root, fs.FileInfoToDirEntry(info), out)
+				emitEntry(".", root, fs.FileInfoToDirEntry(info), out)
 			}()
 			for m := range out {
 				idx[m.Path] = m

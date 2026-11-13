@@ -57,7 +57,6 @@ func (m *Matcher) Match(rel string, isDir bool) bool {
 	if m == nil || rel == "." {
 		return false
 	}
-	rel = path.Clean(rel)
 	for _, r := range m.rules {
 		if r.dirOnly && !isDir {
 			continue
