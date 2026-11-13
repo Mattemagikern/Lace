@@ -60,6 +60,7 @@ type Connection struct {
 
 	sendBuf bytes.Buffer
 	readBuf []byte
+	msgEnc  *msgpack.Encoder
 }
 
 func NewConnection(pipe exec.Pipe) *Connection {
@@ -68,9 +69,10 @@ func NewConnection(pipe exec.Pipe) *Connection {
 		zstd.WithEncoderConcurrency(1))
 	dec, _ := zstd.NewReader(pipe, zstd.WithDecoderConcurrency(1))
 	return &Connection{
-		pipe: pipe,
-		enc:  enc,
-		dec:  dec,
+		pipe:   pipe,
+		enc:    enc,
+		dec:    dec,
+		msgEnc: msgpack.NewEncoder(nil),
 	}
 }
 
@@ -110,7 +112,8 @@ func (c *Connection) SendMessageNoFlush(msgType MessageType, payload interface{}
 	var header [6]byte
 	c.sendBuf.Write(header[:])
 
-	if err := msgpack.NewEncoder(&c.sendBuf).Encode(payload); err != nil {
+	c.msgEnc.Reset(&c.sendBuf)
+	if err := c.msgEnc.Encode(payload); err != nil {
 		return fmt.Errorf("encode payload: %w", err)
 	}
 
