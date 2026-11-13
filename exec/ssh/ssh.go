@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mattemagikern/lace/cfg"
 	"github.com/mattemagikern/lace/exec"
@@ -15,12 +17,26 @@ import (
 var (
 	clientsMu sync.Mutex
 	clients   = map[string]*ssh.Client{}
+	connSeq   atomic.Uint64
 )
 
-func sharedClient(remote string, cfg *ssh.ClientConfig, chain []hop) (*ssh.Client, error) {
+const maxConnShards = 4
+
+func connShards() int {
+	n := cfg.Jobs
+	if n > maxConnShards {
+		n = maxConnShards
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func sharedClient(remote string, cfg *ssh.ClientConfig, chain []hop, shard int) (*ssh.Client, error) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
-	key := clientKey(remote, chain)
+	key := clientKey(remote, chain, shard)
 	if c, ok := clients[key]; ok {
 		return c, nil
 	}
@@ -32,8 +48,8 @@ func sharedClient(remote string, cfg *ssh.ClientConfig, chain []hop) (*ssh.Clien
 	return c, nil
 }
 
-func clientKey(remote string, chain []hop) string {
-	key := remote
+func clientKey(remote string, chain []hop, shard int) string {
+	key := strconv.Itoa(shard) + "|" + remote
 	for _, h := range chain {
 		key = h.remote + "|" + key
 	}
@@ -132,7 +148,8 @@ func NewPipe(target string, command string) exec.Pipe {
 }
 
 func (peer *SSH) Open() error {
-	client, err := sharedClient(peer.remote, peer.ssh_cfg, peer.chain)
+	shard := int(connSeq.Add(1)-1) % connShards()
+	client, err := sharedClient(peer.remote, peer.ssh_cfg, peer.chain, shard)
 	if err != nil {
 		return err
 	}
