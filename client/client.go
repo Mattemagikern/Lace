@@ -3,10 +3,13 @@ package client
 import (
 	"fmt"
 	"log/slog"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/schollz/progressbar/v3"
 
 	"github.com/mattemagikern/lace/files"
 )
@@ -95,6 +98,21 @@ func sortedKeys(idx files.FileIndex) []string {
 	return keys
 }
 
+func sortedKeysSymlinksLast(idx files.FileIndex) []string {
+	regular := make([]string, 0, len(idx))
+	links := make([]string, 0)
+	for k, m := range idx {
+		if m.Mode&os.ModeSymlink != 0 {
+			links = append(links, k)
+			continue
+		}
+		regular = append(regular, k)
+	}
+	sort.Strings(regular)
+	sort.Strings(links)
+	return append(regular, links...)
+}
+
 func (c *Client) Push() error {
 	c.st.Set("Comparing...")
 	changed, deleted := files.FilterFiles(c.index, c.remote_index)
@@ -105,8 +123,8 @@ func (c *Client) Push() error {
 	}
 
 	c.st.Set("Deleting...")
-	for _, path := range sortedKeys(deleted) {
-		if err := c.ws.DeleteFile(filepath.Join(c.remote_root, path), true); err != nil {
+	for _, p := range sortedKeys(deleted) {
+		if err := c.ws.DeleteFile(path.Join(c.remote_root, p), true); err != nil {
 			return err
 		}
 	}
@@ -117,12 +135,15 @@ func (c *Client) Push() error {
 		byteCount += int(k.Size)
 	}
 
-	if byteCount == 0 {
+	if len(changed) == 0 {
 		return nil
 	}
 
-	progress := newProgressBar(byteCount, "Upload progress:")
-	for _, p := range sortedKeys(changed) {
+	var progress *progressbar.ProgressBar
+	if byteCount > 0 {
+		progress = newProgressBar(byteCount, "Upload progress:")
+	}
+	for _, p := range sortedKeysSymlinksLast(changed) {
 		meta := changed[p]
 		err := c.ws.WriteFile(meta,
 			filepath.Join(c.root, p),
@@ -157,12 +178,15 @@ func (c *Client) Pull() error {
 	for _, k := range changed {
 		byteCount += int(k.Size)
 	}
-	if byteCount == 0 {
+	if len(changed) == 0 {
 		return nil
 	}
 
-	progress := newProgressBar(byteCount, "Download progress:")
-	for _, p := range sortedKeys(changed) {
+	var progress *progressbar.ProgressBar
+	if byteCount > 0 {
+		progress = newProgressBar(byteCount, "Download progress:")
+	}
+	for _, p := range sortedKeysSymlinksLast(changed) {
 		meta := changed[p]
 		err := c.ws.ReadFile(meta,
 			filepath.Join(c.root, p),
