@@ -92,30 +92,29 @@ func (idx *FileIndex) DecodeMsgpack(dec *msgpack.Decoder) error {
 	return nil
 }
 
-func emitEntry(rel, path string, d fs.DirEntry, out chan<- MetaData) error {
+func makeEntry(rel, path string, d fs.DirEntry) (MetaData, error) {
 	info, err := d.Info()
 	if err != nil {
-		return err
+		return MetaData{}, err
 	}
 	link := ""
 	if info.Mode()&os.ModeSymlink != 0 {
 		link, _ = os.Readlink(path)
 	}
-	out <- MetaData{
+	return MetaData{
 		Path:  rel,
 		Size:  info.Size(),
 		Mode:  info.Mode(),
 		IsDir: d.IsDir(),
 		Time:  info.ModTime().Unix(),
 		Link:  link,
-	}
-	return nil
+	}, nil
 }
 
 type walkState struct {
 	root     string
 	ig       *Matcher
-	out      chan<- MetaData
+	out      chan<- []MetaData
 	sem      chan struct{}
 	wg       sync.WaitGroup
 	errMu    sync.Mutex
@@ -148,16 +147,19 @@ func (s *walkState) walk(dir string) {
 		return
 	}
 
+	batch := make([]MetaData, 0, len(entries))
 	for _, e := range entries {
 		path := filepath.Join(dir, e.Name())
 		rel := s.rel(path)
 		if s.ig.Match(filepath.ToSlash(rel), e.IsDir()) {
 			continue
 		}
-		if err := emitEntry(rel, path, e, s.out); err != nil {
+		m, err := makeEntry(rel, path, e)
+		if err != nil {
 			s.fail(err)
 			continue
 		}
+		batch = append(batch, m)
 		if e.IsDir() {
 			s.wg.Add(1)
 			select {
@@ -171,33 +173,34 @@ func (s *walkState) walk(dir string) {
 			}
 		}
 	}
+	if len(batch) > 0 {
+		s.out <- batch
+	}
 }
 
 func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
 	root = filepath.Clean(ExpandPath(root))
-	idx := make(FileIndex)
 
 	info, err := os.Lstat(root)
 	if err != nil {
 		return nil, err
 	}
 	if !info.IsDir() {
+		idx := make(FileIndex)
 		if !ig.Match(".", false) {
-			out := make(chan MetaData, 1)
-			go func() {
-				defer close(out)
-				emitEntry(".", root, fs.FileInfoToDirEntry(info), out)
-			}()
-			for m := range out {
-				idx[m.Path] = m
+			m, err := makeEntry(".", root, fs.FileInfoToDirEntry(info))
+			if err != nil {
+				return idx, err
 			}
+			idx[m.Path] = m
 		}
 		return idx, nil
 	}
 
+	idx := make(FileIndex, 4096)
 	idx["."] = MetaData{Path: ".", IsDir: true, Mode: os.ModeDir}
 
-	out := make(chan MetaData, 1024)
+	out := make(chan []MetaData, 256)
 	s := &walkState{
 		root: root,
 		ig:   ig,
@@ -213,8 +216,10 @@ func MakeIndex(root string, ig *Matcher) (FileIndex, error) {
 		close(out)
 	}()
 
-	for m := range out {
-		idx[m.Path] = m
+	for batch := range out {
+		for _, m := range batch {
+			idx[m.Path] = m
+		}
 	}
 
 	return idx, s.firstErr
