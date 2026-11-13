@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -104,12 +105,23 @@ func (w *Server) handleRead(payload interface{}) error {
 
 func (w *Server) handleDelete(payload interface{}) error {
 	dp := payload.(*protocol.DeletePayload)
-	slog.Default().Info(fmt.Sprintf("Delete: %v", dp.Path))
+	paths := dp.Paths
+	if len(paths) == 0 && dp.Path != "" {
+		paths = []string{dp.Path}
+	}
+	logger := slog.Default()
+	if logger.Enabled(context.Background(), slog.LevelInfo) {
+		for _, p := range paths {
+			logger.Info("Delete", "path", p)
+		}
+	}
 	if w.dry_run {
 		return nil
 	}
-	if err := os.RemoveAll(files.ExpandPath(dp.Path)); err != nil {
-		return fmt.Errorf("delete %s: %w", dp.Path, err)
+	for _, p := range paths {
+		if err := os.RemoveAll(files.ExpandPath(p)); err != nil {
+			return fmt.Errorf("delete %s: %w", p, err)
+		}
 	}
 	return nil
 }

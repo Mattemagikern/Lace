@@ -123,10 +123,12 @@ func (c *Client) Push() error {
 	}
 
 	c.st.Set("Deleting...")
-	for _, p := range sortedKeys(deleted) {
-		if err := c.ws.DeleteFile(path.Join(c.remote_root, p), true); err != nil {
-			return err
-		}
+	del := sortedKeys(deleted)
+	for i, p := range del {
+		del[i] = path.Join(c.remote_root, p)
+	}
+	if err := c.ws.DeleteFiles(del, true); err != nil {
+		return err
 	}
 	c.st.Clear()
 
@@ -167,10 +169,12 @@ func (c *Client) Pull() error {
 	}
 
 	c.st.Set("Deleting...")
-	for _, p := range sortedKeys(deleted) {
-		if err := c.ws.DeleteFile(filepath.Join(c.root, p), false); err != nil {
-			return err
-		}
+	del := sortedKeys(deleted)
+	for i, p := range del {
+		del[i] = filepath.Join(c.root, p)
+	}
+	if err := c.ws.DeleteFiles(del, false); err != nil {
+		return err
 	}
 	c.st.Clear()
 

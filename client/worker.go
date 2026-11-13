@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,12 +18,21 @@ import (
 )
 
 const readWindow = 32
+const remoteDeleteBatch = 1000
+const localDeleteBatch = 64
 
 type workerCtx struct {
 	c       *protocol.Connection
 	mkdir   *files.MkdirCache
-	pending chan<- pendingResp
+	pending chan pendingResp
+	ops     <-chan Op
 	dryrun  bool
+	dirty   bool
+}
+
+func (w *workerCtx) flush() error {
+	w.dirty = false
+	return w.c.Flush()
 }
 
 type Op interface {
@@ -66,32 +76,45 @@ type readOp struct {
 }
 
 func (o *readOp) Execute(w *workerCtx) error {
-	if err := w.c.SendMessage(protocol.TypeRead, &protocol.ReadPayload{Path: o.remotePath}); err != nil {
+	if err := w.c.SendMessageNoFlush(protocol.TypeRead, &protocol.ReadPayload{Path: o.remotePath}); err != nil {
 		return fmt.Errorf("send read req: %w", err)
+	}
+	w.dirty = true
+	if len(w.pending)+1 >= cap(w.pending) || len(w.ops) == 0 {
+		if err := w.flush(); err != nil {
+			return fmt.Errorf("flush read req: %w", err)
+		}
 	}
 	w.pending <- pendingResp{kind: pendRead, localPath: o.localPath, progress: o.progress}
 	return nil
 }
 
 type deleteOp struct {
-	path   string
+	paths  []string
 	remote bool
 }
 
 func (o *deleteOp) Execute(w *workerCtx) error {
 	logger := slog.Default()
-	logger.Info(fmt.Sprintf("Delete-> path: %s", o.path))
+	if logger.Enabled(context.Background(), slog.LevelInfo) {
+		for _, p := range o.paths {
+			logger.Info("Delete->", "path", p)
+		}
+	}
 	if w.dryrun {
 		return nil
 	}
 	if o.remote {
-		if err := w.c.SendMessage(protocol.TypeDelete, &protocol.DeletePayload{Path: o.path}); err != nil {
+		if err := w.c.SendMessageNoFlush(protocol.TypeDelete, &protocol.DeletePayload{Paths: o.paths}); err != nil {
 			return fmt.Errorf("send delete: %w", err)
 		}
+		w.dirty = true
 		return nil
 	}
-	if err := os.RemoveAll(o.path); err != nil {
-		logger.Error(fmt.Sprintf("delete file: %v", err))
+	for _, p := range o.paths {
+		if err := os.RemoveAll(p); err != nil {
+			logger.Error(fmt.Sprintf("delete file: %v", err))
+		}
 	}
 	return nil
 }
@@ -103,9 +126,13 @@ type indexOp struct {
 }
 
 func (o *indexOp) Execute(w *workerCtx) error {
-	if err := w.c.SendMessage(protocol.TypeIndex, &protocol.IndexPayload{Root: o.path, Ignore: o.ignore}); err != nil {
+	if err := w.c.SendMessageNoFlush(protocol.TypeIndex, &protocol.IndexPayload{Root: o.path, Ignore: o.ignore}); err != nil {
 		o.res <- nil
 		return fmt.Errorf("send index req: %w", err)
+	}
+	if err := w.flush(); err != nil {
+		o.res <- nil
+		return fmt.Errorf("flush index req: %w", err)
 	}
 	w.pending <- pendingResp{kind: pendIndex, indexRes: o.res}
 	return nil
@@ -202,8 +229,18 @@ func (ws *WorkSet) ReadFile(meta files.MetaData, localPath, remotePath string, p
 	return ws.Submit(&readOp{localPath: localPath, remotePath: remotePath, progress: progress})
 }
 
-func (ws *WorkSet) DeleteFile(path string, remote bool) error {
-	return ws.Submit(&deleteOp{path: path, remote: remote})
+func (ws *WorkSet) DeleteFiles(paths []string, remote bool) error {
+	batch := localDeleteBatch
+	if remote {
+		batch = remoteDeleteBatch
+	}
+	for i := 0; i < len(paths); i += batch {
+		end := min(i+batch, len(paths))
+		if err := ws.Submit(&deleteOp{paths: paths[i:end], remote: remote}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ws *WorkSet) Close() {
@@ -271,7 +308,21 @@ func (ws *WorkSet) Worker(pipe exec.Pipe, dryrun bool) {
 		}
 	}()
 
+	ctx := &workerCtx{
+		c:       c,
+		mkdir:   &ws.mkdir,
+		pending: pending,
+		ops:     ws.Ops,
+		dryrun:  dryrun,
+	}
+
 	defer func() {
+		if !connBroken && ctx.dirty {
+			if err := ctx.flush(); err != nil {
+				logger.Error(fmt.Sprintf("flush error:%v", err))
+				connBroken = true
+			}
+		}
 		close(pending)
 		<-receiverDone
 		if !connBroken {
@@ -285,18 +336,18 @@ func (ws *WorkSet) Worker(pipe exec.Pipe, dryrun bool) {
 		c.Close()
 	}()
 
-	ctx := &workerCtx{
-		c:       c,
-		mkdir:   &ws.mkdir,
-		pending: pending,
-		dryrun:  dryrun,
-	}
-
 	for op := range ws.Ops {
 		if err := op.Execute(ctx); err != nil {
 			logger.Error(fmt.Sprintf("op failed: %v", err))
 			connBroken = true
 			return
+		}
+		if ctx.dirty && len(ws.Ops) == 0 {
+			if err := ctx.flush(); err != nil {
+				logger.Error(fmt.Sprintf("flush failed: %v", err))
+				connBroken = true
+				return
+			}
 		}
 	}
 }

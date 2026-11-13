@@ -36,7 +36,8 @@ type WritePayload struct {
 }
 
 type DeletePayload struct {
-	Path string
+	Path  string
+	Paths []string
 }
 
 type ReadPayload struct {
